@@ -4,3 +4,7 @@ pydantic
 pydantic-settings
 python-dotenv
 supabase
+google-genai
+PyMuPDF
+python-docx
+openpyxl

@@ -1,13 +1,12 @@
 from models import Category
+from llm import classify_with_llm
 
 
 def classify_email(email: dict) -> tuple[Category, str]:
-    """Classify an organizer email using deterministic rules first."""
+    """Rules first; Gemini fallback only when rules are insufficient."""
 
     subject = email.get("subject", "")
     body = email.get("body", "")
-    attachments = email.get("attachments", [])
-
     text = f"{subject}\n{body}".lower()
 
     spam_terms = (
@@ -44,9 +43,10 @@ def classify_email(email: dict) -> tuple[Category, str]:
         "checking",
     )
 
+    # Do NOT require two attachments here.
+    # Missing attachments must still reach reliability.py.
     if (
-        len(attachments) >= 2
-        and mentions_si
+        mentions_si
         and mentions_bl
         and any(term in text for term in comparison_terms)
     ):
@@ -66,12 +66,19 @@ def classify_email(email: dict) -> tuple[Category, str]:
 
     si_terms = (
         "request si",
-        "cust si",
-        "please find shipping instruction",
+        "prepare si",
+        "new si",
         "shipping instruction for",
     )
 
     if any(term in text for term in si_terms):
         return "SI_REQUEST", "rule"
 
+    # Rules are uncertain: ask Gemini.
+    llm_category = classify_with_llm(email)
+
+    if llm_category is not None:
+        return llm_category, "llm"
+
+    # Safe deterministic fallback if AI is unavailable/fails.
     return "GENERAL", "rule"

@@ -8,7 +8,10 @@ from pipeline import normalize
 from pipeline import reliability
 
 
-def process_email(email: dict) -> EmailResult:
+def process_email(
+    email: dict,
+    attachment_bytes: dict[str, bytes] | None = None,
+) -> EmailResult:
     category, decided_by = classify.classify_email(email)
 
     if category != "BL_COMPARISON":
@@ -18,7 +21,10 @@ def process_email(email: dict) -> EmailResult:
             decided_by=decided_by,
         )
 
-    si_text, bl_text = documents.load_pair(email)
+    si_text, bl_text = documents.load_pair(
+        email,
+        attachment_bytes=attachment_bytes,
+    )
 
     review_reason = reliability.check(
         email,
