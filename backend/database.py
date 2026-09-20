@@ -90,6 +90,41 @@ def upsert_email(result: Any) -> dict:
     return response.data[0] if response.data else row
 
 
+def upsert_email_source(
+    email_id: str,
+    *,
+    sender: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    source_attachments: list[str] | None = None,
+) -> dict:
+    """Persist only the raw organizer source fields for an email.
+
+    Writes exactly email_id/sender/subject/body/source_attachments and
+    nothing else — never category/status/si/bl/defect_fields/has_defect/
+    review_reason/decided_by/notes/processing_status/retry_count/last_error/
+    reviewed_at/reviewer_notes. Safe to call repeatedly for the same
+    email_id: it only ever updates these same raw columns.
+    """
+    if not email_id:
+        raise ValueError("upsert_email_source() requires a non-empty 'email_id'")
+
+    row = {
+        "email_id": email_id,
+        "sender": sender,
+        "subject": subject,
+        "body": body,
+        "source_attachments": source_attachments,
+    }
+    client = get_supabase_client()
+    response = (
+        client.table("emails")
+        .upsert(row, on_conflict="email_id")
+        .execute()
+    )
+    return response.data[0] if response.data else row
+
+
 def list_emails(
     *,
     status: str | None = None,
@@ -194,6 +229,12 @@ def upload_document(
     client = get_supabase_client()
     client.storage.from_(bucket).upload(storage_path, data, file_options or None)
     return storage_path
+
+
+def download_document(storage_path: str, *, bucket: str = DOCUMENTS_BUCKET) -> bytes:
+    """Download raw bytes of a private document by storage_path. No parsing, no classification."""
+    client = get_supabase_client()
+    return client.storage.from_(bucket).download(storage_path)
 
 
 def create_signed_document_url(
