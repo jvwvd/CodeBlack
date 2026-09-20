@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import database
+import orchestration
 from config import settings
 
 logger = logging.getLogger("sdoc.backend")
@@ -72,3 +73,11 @@ def get_signed_document_url(path: str = Query(..., min_length=1)):
         raise HTTPException(status_code=400, detail="invalid document path")
     url = database.create_signed_document_url(cleaned)
     return {"url": url, "expires_in": database.DEFAULT_SIGNED_URL_EXPIRY_SECONDS}
+
+
+@app.post("/api/emails/{email_id}/process")
+def process_email_endpoint(email_id: str):
+    result = orchestration.process_and_persist_email(email_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"email not found: {email_id}")
+    return result

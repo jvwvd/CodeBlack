@@ -107,7 +107,7 @@ Rules:
 - `pipeline/run.py` is the **only** shared pipeline orchestrator; nothing else calls `classify`/`extract`/`normalize`/`compare`/`reliability` directly.
 - The frontend never performs verification or business calculations — it renders what the backend returns.
 - `backend/import_organizer_data.py` is a controlled, on-demand organizer-bundle → Supabase import utility (Member 2-owned). It is **not** part of FastAPI startup, not a request handler, not pipeline logic, and not a background service. See §14 ("Cloud Import") for the import flow and §16 for ownership.
-- `backend/orchestration.py` is the controlled bridge between Supabase persistence/storage and the Member-1 pipeline (Member 2-owned). It is the **one** place allowed to import both `database.py` and `pipeline.run`/`models` in the same process. It does not persist results, does not add API routes, and does not implement any classification/extraction/comparison/reliability logic itself. See §16 for the frozen `process_stored_email()` signature.
+- `backend/orchestration.py` is the controlled bridge between Supabase persistence/storage and the Member-1 pipeline (Member 2-owned). It is the **one** place allowed to import both `database.py` and `pipeline.run`/`models` in the same process. `process_stored_email()` itself does not persist results or add API routes; `process_and_persist_email()` is the explicit persistence wrapper around it. Neither implements any classification/extraction/comparison/reliability logic itself. See §16 for both frozen signatures.
 
 Not every file above exists yet at any given point in the project's life; this tree describes the target frozen shape everyone builds toward, not a claim that all files are already present.
 
@@ -516,6 +516,8 @@ Member 2 must **not** perform classification, SI/BL identification, extraction, 
 def process_stored_email(email_id: str) -> EmailResult | None:
 ```
 It reads the stored email row via `database.get_email()`, reconstructs the organizer-shaped dict, downloads attachment bytes via `database.list_attachments()` + `database.download_document()` (keyed by the *original organizer attachment reference*, matched to stored rows by basename — never guessed when ambiguous or absent), and calls `pipeline.run.process_email()` unmodified, returning its `EmailResult` as-is. **It does not persist the result** — persistence remains a separate, explicit step for whatever caller invokes it.
+
+**`process_and_persist_email(email_id: str) -> EmailResult | None`** is that explicit persistence wrapper. It marks `processing_status = 'processing'` (clearing any stale `last_error`), calls `process_stored_email()`, and — on a successful `EmailResult` — persists it via `database.upsert_email()` and marks `processing_status = 'completed'` (clearing `last_error`) before returning the result unchanged. On `None` (email not found) it returns `None` without persisting anything or calling `upsert_email()`. On any unexpected exception during processing or persistence, it marks `processing_status = 'failed'` with a bounded, redacted error summary (URLs and key=value-style secrets/tokens stripped; unusually long messages replaced with a generic note rather than stored raw) and re-raises. It adds no retry/concurrency/idempotency guards. It is exposed via `POST /api/emails/{email_id}/process` — `200` with the `EmailResult` body on success, `404` if the email does not exist, `500` via the existing generic exception handler on any other failure.
 
 ---
 

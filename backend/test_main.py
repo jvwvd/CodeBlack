@@ -16,6 +16,8 @@ from fastapi.testclient import TestClient
 
 import database
 import main
+import orchestration
+from models import EmailResult
 
 client = TestClient(main.app, raise_server_exceptions=False)
 
@@ -159,6 +161,38 @@ class SignedUrlEndpointTests(unittest.TestCase):
         ):
             response = client.get("/api/documents/signed-url?path=..\\file.txt")
         self.assertEqual(response.status_code, 400)
+
+
+class ProcessEmailEndpointTests(unittest.TestCase):
+    def test_success_returns_200_with_canonical_email_result_body(self):
+        fake_result = EmailResult(
+            email_id="email_004", category="BL_COMPARISON", status="OK",
+            notes="No mismatch detected.",
+        )
+        with patch.object(
+            orchestration, "process_and_persist_email", return_value=fake_result
+        ) as mocked:
+            response = client.post("/api/emails/email_004/process")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), fake_result.model_dump(mode="json"))
+        mocked.assert_called_once_with("email_004")
+
+    def test_unknown_email_returns_404(self):
+        with patch.object(orchestration, "process_and_persist_email", return_value=None):
+            response = client.post("/api/emails/email_missing/process")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("email_missing", response.json()["detail"])
+
+    def test_orchestration_exception_returns_generic_500_without_leaking_details(self):
+        with patch.object(
+            orchestration, "process_and_persist_email",
+            side_effect=RuntimeError("internal failure with api_key=SUPER_SECRET_VALUE"),
+        ):
+            response = client.post("/api/emails/email_004/process")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"detail": "internal server error"})
+        self.assertNotIn("SUPER_SECRET_VALUE", response.text)
+        self.assertNotIn("RuntimeError", response.text)
 
 
 class ErrorHandlingTests(unittest.TestCase):

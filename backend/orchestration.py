@@ -4,9 +4,11 @@ Member-1 pipeline, without putting orchestration inside database.py,
 main.py, or pipeline/run.py.
 
 The one deliberate place allowed to import both database.py and
-pipeline.run/models in the same process (see PROJECT_RULES.md §16). Does
-not persist results, does not add API routes, and does not implement any
-classification/extraction/comparison/reliability logic itself.
+pipeline.run/models in the same process (see PROJECT_RULES.md §16).
+process_stored_email() itself does not persist results or add API routes;
+process_and_persist_email() is the explicit persistence wrapper around it.
+Neither implements any classification/extraction/comparison/reliability
+logic itself.
 """
 from pathlib import PurePosixPath
 
@@ -72,3 +74,45 @@ def process_stored_email(email_id: str) -> EmailResult | None:
     attachment_bytes = _build_attachment_bytes(email_id, email["attachments"])
 
     return process_email(email, attachment_bytes=attachment_bytes)
+
+
+def _safe_error_message(exc: Exception) -> str:
+    """A generic, bounded summary safe to store in emails.last_error.
+
+    Deliberately never includes any portion of str(exc): regex-based
+    redaction can miss formats such as "Authorization: Bearer <token>",
+    JWTs, connection strings, provider payloads, or other unanticipated
+    credential shapes. Only the exception's class name is exposed — the
+    API already returns a generic 500 to callers regardless.
+    """
+    return f"{type(exc).__name__}: processing failed"
+
+
+def process_and_persist_email(email_id: str) -> EmailResult | None:
+    """Run one stored email through the pipeline and persist the result,
+    tracking processing_status/last_error around the attempt.
+
+    Returns None (without persisting anything) if the email does not
+    exist. On success, persists the EmailResult via database.upsert_email()
+    and returns it unchanged. On any unexpected exception during processing
+    or persistence, marks processing_status = "failed" with a safe,
+    sanitized error summary and re-raises so main.py's existing generic
+    exception handler returns the standard safe 500 response.
+
+    Deliberately does not add retry/concurrency/idempotency guards.
+    """
+    database.update_processing_state(email_id, "processing", last_error=None)
+
+    try:
+        result = process_stored_email(email_id)
+        if result is None:
+            return None
+        database.upsert_email(result)
+    except Exception as exc:
+        database.update_processing_state(
+            email_id, "failed", last_error=_safe_error_message(exc)
+        )
+        raise
+
+    database.update_processing_state(email_id, "completed", last_error=None)
+    return result
