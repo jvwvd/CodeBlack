@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     SUPABASE_URL: str | None = None
     SUPABASE_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
+    OPENCODE_API_KEY: str | None = None
+    OPENCODE_MODEL: str | None = None
     FRONTEND_URL: str | None = None
 
 
