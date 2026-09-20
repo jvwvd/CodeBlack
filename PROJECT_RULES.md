@@ -72,6 +72,7 @@ sdoc/
 │   ├── database.py
 │   ├── loader.py
 │   ├── import_organizer_data.py
+│   ├── orchestration.py
 │   └── pipeline/
 │       ├── __init__.py
 │       ├── classify.py
@@ -106,6 +107,7 @@ Rules:
 - `pipeline/run.py` is the **only** shared pipeline orchestrator; nothing else calls `classify`/`extract`/`normalize`/`compare`/`reliability` directly.
 - The frontend never performs verification or business calculations — it renders what the backend returns.
 - `backend/import_organizer_data.py` is a controlled, on-demand organizer-bundle → Supabase import utility (Member 2-owned). It is **not** part of FastAPI startup, not a request handler, not pipeline logic, and not a background service. See §14 ("Cloud Import") for the import flow and §16 for ownership.
+- `backend/orchestration.py` is the controlled bridge between Supabase persistence/storage and the Member-1 pipeline (Member 2-owned). It is the **one** place allowed to import both `database.py` and `pipeline.run`/`models` in the same process. It does not persist results, does not add API routes, and does not implement any classification/extraction/comparison/reliability logic itself. See §16 for the frozen `process_stored_email()` signature.
 
 Not every file above exists yet at any given point in the project's life; this tree describes the target frozen shape everyone builds toward, not a claim that all files are already present.
 
@@ -491,6 +493,7 @@ The reviewer workflow may correct or confirm a result. When surfacing a case for
 - `main.py`, `config.py`, `database.py`, `Dockerfile`
 - `backend/loader.py` integration responsibility (the organizer file itself remains unmodified, per §11)
 - `backend/import_organizer_data.py` — organizer bundle → Supabase cloud dataset import (see §14, "Cloud Import")
+- `backend/orchestration.py` — Supabase → Member-1 pipeline bridge (see below)
 - FastAPI, Supabase PostgreSQL/Storage, Cloud Run, backend integration/deployment
 
 **Member 3 — Frontend**
@@ -506,7 +509,13 @@ Ownership prevents duplicate implementations, but integration points (§7's `Ema
 1. A plain email dict reconstructed in the organizer shape — see §14, "Cloud Import."
 2. Access to the corresponding raw attachment bytes from private Storage.
 
-Member 2 must **not** perform classification, SI/BL identification, extraction, normalization, comparison, or reliability decisions — those remain exclusively Member 1's, per §8. A future Storage download/read helper may be required in `database.py` to satisfy (2); **its exact function signature is intentionally not frozen yet.**
+Member 2 must **not** perform classification, SI/BL identification, extraction, normalization, comparison, or reliability decisions — those remain exclusively Member 1's, per §8.
+
+**This boundary is implemented by `backend/orchestration.py`**, frozen as:
+```python
+def process_stored_email(email_id: str) -> EmailResult | None:
+```
+It reads the stored email row via `database.get_email()`, reconstructs the organizer-shaped dict, downloads attachment bytes via `database.list_attachments()` + `database.download_document()` (keyed by the *original organizer attachment reference*, matched to stored rows by basename — never guessed when ambiguous or absent), and calls `pipeline.run.process_email()` unmodified, returning its `EmailResult` as-is. **It does not persist the result** — persistence remains a separate, explicit step for whatever caller invokes it.
 
 ---
 
