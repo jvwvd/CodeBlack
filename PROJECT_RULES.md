@@ -71,6 +71,7 @@ sdoc/
 │   ├── llm.py
 │   ├── database.py
 │   ├── loader.py
+│   ├── import_organizer_data.py
 │   └── pipeline/
 │       ├── __init__.py
 │       ├── classify.py
@@ -104,6 +105,7 @@ Rules:
 - Keep the structure shallow — no nested layering beyond what's shown above.
 - `pipeline/run.py` is the **only** shared pipeline orchestrator; nothing else calls `classify`/`extract`/`normalize`/`compare`/`reliability` directly.
 - The frontend never performs verification or business calculations — it renders what the backend returns.
+- `backend/import_organizer_data.py` is a controlled, on-demand organizer-bundle → Supabase import utility (Member 2-owned). It is **not** part of FastAPI startup, not a request handler, not pipeline logic, and not a background service. See §14 ("Cloud Import") for the import flow and §16 for ownership.
 
 Not every file above exists yet at any given point in the project's life; this tree describes the target frozen shape everyone builds toward, not a claim that all files are already present.
 
@@ -289,6 +291,8 @@ It already provides source-independent access for:
 
 **Do not add Supabase/cloud helpers to the organizer's `loader.py`. Do not refactor it.** If cloud-sourced email access is ever needed, it belongs in a separate function, not a modification of this file (see §3, §16 for ownership).
 
+**Development/evaluation vs. deployment data source.** `backend/loader.py` (and the organizer bundle/Docker server it reads from) is a **development and evaluation dependency only** — used for local pipeline development and for `evaluation/`'s full-dataset runs and `/submit` scoring. The **deployed** Cloud Run application never calls `loader.py` and must never depend on the organizer Docker server being reachable at runtime. Instead, the organizer's participant data is imported once into our own Supabase PostgreSQL + private Storage (see §14, "Cloud Import"), and the deployed API and pipeline read exclusively from there. `backend/import_organizer_data.py` (§3, §16) is the one deliberate bridge allowed to call both `loader.py` and `database.py` in the same process — nothing else should.
+
 ---
 
 ## 12. Organizer Public HTTP Contract
@@ -335,7 +339,7 @@ The internal `EmailResult` (§7) carries richer information. Projection from `Em
 
 ## 14. Supabase Persistence Contract
 
-**`public.emails`**
+**`public.emails` — current deployed schema**
 ```
 email_id            TEXT primary key
 category
@@ -356,6 +360,24 @@ created_at
 updated_at
 ```
 
+**`public.emails` — approved target schema addition (NOT YET MIGRATED)**
+
+The team has approved adding raw/source organizer fields to this same table (see "Cloud Import" below for the full rationale). **These columns do not exist in Supabase yet** — this is a frozen contract decision, not a statement of current physical schema. Once the migration is written, executed, and verified, this section will be updated to move these into the "current deployed schema" block above and this callout will be removed.
+
+```
+sender               TEXT   -- approved, pending migration
+subject              TEXT   -- approved, pending migration
+body                 TEXT   -- approved, pending migration
+source_attachments   TEXT[] -- approved, pending migration
+```
+
+| Column | Meaning |
+|---|---|
+| `sender` | Verbatim value of the organizer email's `from` field |
+| `subject` | Verbatim value of the organizer email's `subject` field |
+| `body` | Verbatim value of the organizer email's `body` field |
+| `source_attachments` | Verbatim copy of the organizer email's `attachments` list |
+
 **`public.attachments`**
 ```
 id                  UUID primary key
@@ -369,15 +391,83 @@ size_bytes
 created_at
 ```
 
+No column changes are proposed for this table.
+
 **Storage:** one private bucket named `documents`.
 
 Rules:
 - No separate verification table — `EmailResult` fields live directly on `emails`.
 - No separate `review_cases` table — review state is columns on `emails`.
 - No separate SI/BL tables — stored as JSONB on `emails`.
+- **No separate raw/source email table** (`raw_emails`, `source_emails`, `inbox_emails`, or similar) — `public.emails` holds both raw/source organizer information and processing/result/review information in the same row, for the same 1:1-relationship reason the other "no separate table" rules above already exist. Do not create one of these unless a future organizer requirement forces the change.
 - Cross-field business rules (e.g. "`review_reason` implies `status = NEEDS_REVIEW`") belong in Python, never as database constraints/triggers.
 - The frontend must never receive or use backend Supabase secret credentials — it only talks to FastAPI.
 - `database.py` is persistence only: no classification, extraction, comparison, or pipeline orchestration.
+
+### Source + result coexistence
+
+`sender`/`subject`/`body`/`source_attachments` (raw, written once at import) and `category`/`status`/`si`/`bl`/`defect_fields`/`has_defect`/`review_reason`/`decided_by`/`notes`/`processing_status`/`retry_count`/`last_error`/`reviewed_at`/`reviewer_notes` (processing/result/review, written by the pipeline and by reviewers) live on the same row, but are written by different, non-overlapping code paths:
+
+- The importer (`backend/import_organizer_data.py`) may only write the 4 raw columns (+ timestamps). It must never write `category`, `status`, `si`, `bl`, `defect_fields`, `has_defect`, `review_reason`, `decided_by`, `notes`, or any retry/review-state column.
+- `database.py`'s existing `upsert_email()` may only write the processing/result columns (it already filters to exactly the `EmailResult` field set) and must never write the 4 raw columns.
+
+Because these two write paths never touch each other's columns, re-running the importer can never reset or overwrite processing/result/review state, and the pipeline writing a result can never disturb the raw source record — **unless a future explicit reset/reprocessing operation is intentionally implemented and documented here first.**
+
+### Processing-status semantics
+
+`status` and `processing_status` mean different things and **must not be conflated**:
+
+| `processing_status` | Meaning |
+|---|---|
+| `pending` | Email/attachments imported, but processing has not started. |
+| `processing` | Pipeline processing is currently underway. |
+| `completed` | Processing finished successfully; `status` now represents the final verification result. |
+| `failed` | Processing failed; `last_error` may contain internal diagnostic context. |
+
+**`public.emails.status` defaults to `OK` at the database level.** This default **must not** be interpreted as "verified, no mismatch" for a row that has not completed processing — it is simply the column's default value, not a verdict. Consumers (the frontend above all) must check `processing_status` before trusting `status`:
+
+| State | Interpretation |
+|---|---|
+| `processing_status = pending` | **NOT YET VERIFIED** |
+| `processing_status = processing` | **PROCESSING** |
+| `processing_status = completed` + `status = OK` | **VERIFIED / NO MISMATCH** |
+| `processing_status = completed` + `status = MISMATCH` | **VERIFIED / MISMATCH** |
+| `status = NEEDS_REVIEW` | **HUMAN REVIEW** path, per the pipeline/review state |
+
+This is a documentation clarification only — **the actual database default is not changed by this document.**
+
+### Cloud Import (Organizer Bundle → Supabase)
+
+```
+Organizer bundle/Docker
+  → backend/loader.py (unmodified organizer code)
+  → backend/import_organizer_data.py (Member 2, controlled/on-demand utility)
+  → backend/database.py (persistence helpers)
+  → Supabase PostgreSQL (public.emails, public.attachments) + private Storage bucket "documents"
+```
+
+`backend/import_organizer_data.py` is **not** part of FastAPI startup, not a request handler, not pipeline logic, not an evaluation script, and not a background service — it is run manually/on-demand.
+
+**Reconstructed dict.** When code (the importer, or later the pipeline reading imported data) needs the organizer-shaped email dict back, it is reconstructed as:
+```json
+{ "email_id": "...", "from": "...", "subject": "...", "body": "...", "attachments": [...] }
+```
+`sender` → `"from"`. **The organizer's `"from"` key is never renamed to `"sender"` in this dict — only the PostgreSQL column is called `sender`.**
+
+**Storage path convention.** Canonical path for an imported organizer attachment:
+```
+{email_id}/{original_filename}
+```
+Example: `email_004/email_004_SI.txt`. Bucket remains the existing private `documents` bucket. This convention is deterministic, easy to debug, collision-free across emails, preserves the original filename, and supports idempotent re-import. Do not introduce UUID-based filenames unless a future requirement makes them necessary.
+
+**Import idempotency.** The importer must be safe to rerun at any time:
+- **Email source import** — upsert the 4 raw columns for the same `email_id`; must never overwrite processing/result/review fields (see "Source + result coexistence" above).
+- **Attachment Storage upload** — deterministic path (above) + upload with upsert behavior, so a rerun overwrites the same object rather than erroring or duplicating.
+- **Attachment metadata** — relies on the existing `UNIQUE(email_id, storage_path)` constraint on `public.attachments`; upsert rather than insert-and-fail.
+
+**`doc_type` at import time.** `public.attachments.doc_type` is set to `NULL` by the importer. **The importer must never infer `SI`/`BL`/`OTHER` from filenames**, even though organizer filenames often contain `_SI`/`_BL`. Document identification is exclusively Member 1's `pipeline/documents.py` responsibility (§8, §16).
+
+**Import completeness.** A `public.emails` row existing is not sufficient evidence that an email is safely ready for pipeline processing. Before treating an email as fully imported, the source email and all of its referenced attachments must actually be persisted. No new database field is added for this yet; completeness should eventually be checked deterministically by comparing `source_attachments` (what the organizer claims) against the persisted `public.attachments` rows and Storage upload success for that `email_id`. If an import fails partway through, rerunning the importer must safely repair the incomplete state (idempotency above makes this safe by construction).
 
 ---
 
@@ -405,6 +495,7 @@ The reviewer workflow may correct or confirm a result. When surfacing a case for
 **Member 2 — Backend/Cloud/Integration**
 - `main.py`, `config.py`, `database.py`, `Dockerfile`
 - `backend/loader.py` integration responsibility (the organizer file itself remains unmodified, per §11)
+- `backend/import_organizer_data.py` — organizer bundle → Supabase cloud dataset import (see §14, "Cloud Import")
 - FastAPI, Supabase PostgreSQL/Storage, Cloud Run, backend integration/deployment
 
 **Member 3 — Frontend**
@@ -415,6 +506,12 @@ The reviewer workflow may correct or confirm a result. When surfacing a case for
 - `evaluation/` — full dataset runs, `build_submission.py`, `submit.py`, Docker evaluator usage, regression testing, error analysis
 
 Ownership prevents duplicate implementations, but integration points (§7's `EmailResult`, §9's function contracts, §13's projection) are shared and must not be silently changed by one member without updating this document.
+
+**Pipeline integration boundary (Member 2 → Member 1).** For an imported email, Member 2 must eventually make available to Member 1's `pipeline/run.py`:
+1. A plain email dict reconstructed in the organizer shape — see §14, "Cloud Import."
+2. Access to the corresponding raw attachment bytes from private Storage.
+
+Member 2 must **not** perform classification, SI/BL identification, extraction, normalization, comparison, or reliability decisions — those remain exclusively Member 1's, per §8. A future Storage download/read helper may be required in `database.py` to satisfy (2); **its exact function signature is intentionally not frozen yet.**
 
 ---
 
