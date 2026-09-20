@@ -5,6 +5,8 @@ import pymupdf
 from docx import Document
 from openpyxl import load_workbook
 
+from llm import read_scanned_pdf_with_vision
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,14 +36,41 @@ def _parse_txt(data: bytes) -> str | None:
 
 
 def _parse_pdf(data: bytes) -> str | None:
+    """
+    Native PDF extraction first.
+    Vision fallback only when native text is insufficient.
+    """
+
     try:
-        document = pymupdf.open(stream=data, filetype="pdf")
-        text = "\n".join(page.get_text("text") for page in document)
+        document = pymupdf.open(
+            stream=data,
+            filetype="pdf",
+        )
+
+        text = "\n".join(
+            page.get_text("text")
+            for page in document
+        )
+
         document.close()
 
-        return text.strip() or None
     except Exception:
         return None
+
+    native_text = text.strip()
+
+    # Native PDF: cheapest and deterministic path.
+    if len(native_text) >= 20:
+        return native_text
+
+    # Image-only/scanned PDF: Gemini vision fallback.
+    vision_text = read_scanned_pdf_with_vision(data)
+
+    if vision_text and len(vision_text.strip()) >= 20:
+        return vision_text.strip()
+
+    # Existing reliability logic will route this to NEEDS_REVIEW.
+    return None
 
 
 def _parse_docx(data: bytes) -> str | None:

@@ -105,8 +105,8 @@ def extract_fields(text: str) -> ShipmentFields:
     weight_raw = _find(
         text,
         (
-            r"^\s*Gross\s*Weight(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
-            r"^\s*Total Gross Weight(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
+            r"^\s*Gross\s*Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
+            r"^\s*Total Gross Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
         ),
     )
 

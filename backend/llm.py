@@ -1,5 +1,3 @@
-from typing import Literal
-
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -82,6 +80,55 @@ DOCUMENT:
         )
 
         return ShipmentFields.model_validate_json(response.text)
+
+    except Exception:
+        return None
+
+
+def read_scanned_pdf_with_vision(data: bytes) -> str | None:
+    """
+    Read an image-only/scanned PDF with Gemini vision.
+
+    This function performs document reading only.
+    It must never decide OK/MISMATCH/NEEDS_REVIEW.
+    """
+
+    client = _client()
+
+    if client is None:
+        return None
+
+    prompt = """
+Read this scanned shipping document and transcribe the visible text.
+
+Rules:
+- Do not invent or infer missing text.
+- Preserve labels, company names, ports, container quantities, and weights.
+- If text is unreadable, omit it rather than guessing.
+- Return plain extracted text only.
+"""
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Part.from_bytes(
+                    data=data,
+                    mime_type="application/pdf",
+                ),
+                prompt,
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0,
+            ),
+        )
+
+        text = (response.text or "").strip()
+
+        if len(text) < 20:
+            return None
+
+        return text
 
     except Exception:
         return None
