@@ -339,7 +339,7 @@ The internal `EmailResult` (§7) carries richer information. Projection from `Em
 
 ## 14. Supabase Persistence Contract
 
-**`public.emails` — current deployed schema**
+**`public.emails` — current deployed schema (21 columns, verified via `information_schema`)**
 ```
 email_id            TEXT primary key
 category
@@ -358,18 +358,13 @@ reviewed_at
 reviewer_notes
 created_at
 updated_at
+sender              TEXT
+subject             TEXT
+body                TEXT
+source_attachments  TEXT[]
 ```
 
-**`public.emails` — approved target schema addition (NOT YET MIGRATED)**
-
-The team has approved adding raw/source organizer fields to this same table (see "Cloud Import" below for the full rationale). **These columns do not exist in Supabase yet** — this is a frozen contract decision, not a statement of current physical schema. Once the migration is written, executed, and verified, this section will be updated to move these into the "current deployed schema" block above and this callout will be removed.
-
-```
-sender               TEXT   -- approved, pending migration
-subject              TEXT   -- approved, pending migration
-body                 TEXT   -- approved, pending migration
-source_attachments   TEXT[] -- approved, pending migration
-```
+`sender`/`subject`/`body`/`source_attachments` are live columns on `public.emails`, all nullable, no defaults, added via an additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration that touched no other column, table, index, trigger, RLS policy, or Storage configuration.
 
 | Column | Meaning |
 |---|---|
@@ -446,7 +441,7 @@ Organizer bundle/Docker
   → Supabase PostgreSQL (public.emails, public.attachments) + private Storage bucket "documents"
 ```
 
-`backend/import_organizer_data.py` is **not** part of FastAPI startup, not a request handler, not pipeline logic, not an evaluation script, and not a background service — it is run manually/on-demand.
+**`backend/import_organizer_data.py` has not been implemented yet.** It is frozen as a target file in §3's repository structure and owned by Member 2 per §16, but no code exists for it yet — the schema it will write into (above) is live; the importer itself is not. The rules below describe constraints its future implementation must satisfy. Once built, it must be: **not** part of FastAPI startup, not a request handler, not pipeline logic, not an evaluation script, and not a background service — it is run manually/on-demand.
 
 **Reconstructed dict.** When code (the importer, or later the pipeline reading imported data) needs the organizer-shaped email dict back, it is reconstructed as:
 ```json
