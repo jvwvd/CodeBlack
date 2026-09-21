@@ -16,18 +16,32 @@ def norm_company(v: str) -> str:
 def norm_port(v: str) -> str:
     value = v.upper().strip()
 
-    locode = re.search(r"\(([A-Z]{5})\)", value)
-    if locode:
-        return locode.group(1)
+    # A LOCODE in parens is a useful identity anchor, but it must never be
+    # trusted OVER the port name: a source document can carry a stale/wrong
+    # code next to a genuinely different port name (e.g. a defect-injected
+    # "TUTICORIN, INDIA (KEMBA)" where KEMBA is Mombasa's code left over
+    # from the original value). Strip the code out of the text and always
+    # compare on the cleaned NAME; the code is only consulted as a
+    # fallback identity when no name text remains at all (e.g. a bare
+    # "(MYPKG)" with nothing else).
+    locode_match = re.search(r"\(([A-Z]{5})\)", value)
+    locode = locode_match.group(1) if locode_match else None
+
+    name_source = value
+    if locode_match:
+        name_source = value[: locode_match.start()] + value[locode_match.end():]
 
     aliases = {
         "SINGAPORE": "SGSIN",
     }
 
-    cleaned = re.sub(r"[^\w]+", " ", value)
+    cleaned = re.sub(r"[^\w]+", " ", name_source)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-    return aliases.get(cleaned, cleaned)
+    if cleaned:
+        return aliases.get(cleaned, cleaned)
+
+    return locode or ""
 
 
 def norm_weight(v: str) -> float:
