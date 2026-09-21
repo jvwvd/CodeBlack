@@ -11,6 +11,7 @@ Run from inside backend/:
 """
 import io
 import json
+import threading
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -584,6 +585,123 @@ class UploadEmailEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), failed_row)
         mocked_get.assert_called_once()
+
+
+class UploadForeignKeyOrderingTests(unittest.TestCase):
+    """Regression coverage for the upload FK-ordering bug: the parent
+    `emails` row must be persisted via database.upsert_email_source()
+    before any database.create_attachment_record() call for that same
+    email_id, since attachments.email_id has a foreign key onto
+    emails.email_id (Postgres 23503 otherwise). Covers all three upload
+    paths that store attachments: plain multipart files, .eml, and the
+    organizer-bundle/batch path."""
+
+    def test_plain_attachment_upload_creates_parent_row_before_attachment_records(self):
+        call_order: list[str] = []
+        fake_result = EmailResult(email_id="placeholder", category="SI_REQUEST", status="OK")
+
+        def record_source(*args, **kwargs):
+            call_order.append("upsert_email_source")
+            return {"email_id": args[0] if args else kwargs.get("email_id")}
+
+        def record_attachment(*args, **kwargs):
+            call_order.append("create_attachment_record")
+
+        with patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record", side_effect=record_attachment), \
+             patch.object(database, "upsert_email_source", side_effect=record_source), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test SI/BL", "body": "please verify"},
+                files=[
+                    ("files", ("si.txt", b"SI content", "text/plain")),
+                    ("files", ("bl.txt", b"BL content", "text/plain")),
+                ],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(call_order), 3)
+        self.assertEqual(call_order[0], "upsert_email_source")
+        self.assertNotIn("create_attachment_record", call_order[: call_order.index("upsert_email_source") + 1])
+
+    def test_eml_upload_creates_parent_row_before_attachment_records(self):
+        eml_bytes = (
+            b"From: sender@example.com\r\n"
+            b"Subject: Please verify BL\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+            b"\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"Please compare the attached SI and BL.\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b'Content-Disposition: attachment; filename="si.txt"\r\n'
+            b"\r\n"
+            b"SI content\r\n"
+            b"--BOUNDARY--\r\n"
+        )
+        call_order: list[str] = []
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+
+        with patch.object(database, "upload_document"), \
+             patch.object(
+                 database, "create_attachment_record",
+                 side_effect=lambda *a, **k: call_order.append("create_attachment_record"),
+             ), \
+             patch.object(
+                 database, "upsert_email_source",
+                 side_effect=lambda *a, **k: call_order.append("upsert_email_source") or {"email_id": a[0]},
+             ), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("incoming.eml", eml_bytes, "message/rfc822"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(call_order, ["upsert_email_source", "create_attachment_record"])
+
+    def test_bundle_upload_creates_parent_row_before_attachment_records_per_email(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+
+        # Track ordering PER composite email_id, since the batch runs several
+        # emails concurrently across worker threads -- the FK constraint is
+        # per email_id, so what matters is that each email's own
+        # upsert_email_source() call precedes its own create_attachment_record()
+        # call(s), not a single global order across the whole batch.
+        events: dict[str, list[str]] = {}
+        lock = threading.Lock()
+
+        def record_source(email_id, *args, **kwargs):
+            with lock:
+                events.setdefault(email_id, []).append("upsert_email_source")
+            return {"email_id": email_id}
+
+        def record_attachment(email_id, *args, **kwargs):
+            with lock:
+                events.setdefault(email_id, []).append("create_attachment_record")
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress"), \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record", side_effect=record_attachment), \
+             patch.object(database, "upsert_email_source", side_effect=record_source), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # email_001 and email_002 each have exactly one attachment.
+        emails_with_attachments = [eid for eid in events if eid.endswith("email_001") or eid.endswith("email_002")]
+        self.assertEqual(len(emails_with_attachments), 2)
+        for email_id in emails_with_attachments:
+            self.assertEqual(events[email_id], ["upsert_email_source", "create_attachment_record"])
 
 
 def _make_zip(entries: dict) -> bytes:
