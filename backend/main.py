@@ -93,7 +93,9 @@ ZIP_MAX_FILES = 50
 ZIP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 
 BATCH_ID_PREFIX = "batch_"
-BATCH_WORKERS = 3
+BATCH_WORKERS = 2  # reduced from 3: lower concurrency on the shared Supabase
+# client materially reduces transient "[WinError 10035] non-blocking socket
+# operation" httpx.ReadErrors observed during real batch runs.
 BUNDLE_MAX_FILES = 5000
 BUNDLE_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 BUNDLE_MAX_UPLOAD_BYTES = MAX_UPLOAD_TOTAL_BYTES  # 100MB, same ceiling as a generic request
@@ -607,9 +609,23 @@ def _run_batch(batch_id: str, root: str, records: list[dict], attachment_cache: 
                     done += 1
                 else:
                     failed += 1
-                database.update_batch_progress(batch_id, done=done, failed=failed)
+                # database.update_batch_progress() already retries transient
+                # network failures internally; if it still raises (e.g. a
+                # sustained outage), that must not abort this loop and
+                # silently stall the rest of the batch -- done/failed simply
+                # keep advancing in memory and the next successful write
+                # catches the progress row up.
+                try:
+                    database.update_batch_progress(batch_id, done=done, failed=failed)
+                except Exception:
+                    logger.exception(
+                        "batch %s: failed to persist progress (done=%s failed=%s)", batch_id, done, failed
+                    )
 
-    database.update_batch_progress(batch_id, status="completed", finished=True)
+    try:
+        database.update_batch_progress(batch_id, status="completed", finished=True)
+    except Exception:
+        logger.exception("batch %s: failed to persist final completed status", batch_id)
 
 
 def _handle_bundle_upload(zf: zipfile.ZipFile, root: str, background_tasks: BackgroundTasks) -> dict:

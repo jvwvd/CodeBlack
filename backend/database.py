@@ -1,14 +1,47 @@
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable, TypeVar
 
+import httpx
 from supabase import Client, create_client
 
 from config import settings
 
 DOCUMENTS_BUCKET = "documents"
 DEFAULT_SIGNED_URL_EXPIRY_SECONDS = 300
+
+# Bounded retry for transient httpx/network failures (e.g. the
+# "[WinError 10035] non-blocking socket operation" ReadErrors observed
+# under concurrent Supabase calls during batch-upload processing).
+# 3 total attempts, small fixed-step backoff between them.
+_TRANSIENT_RETRY_ATTEMPTS = 3
+_TRANSIENT_RETRY_BACKOFF_SECONDS = 0.2
+
+_T = TypeVar("_T")
+
+
+def _call_with_retry(fn: Callable[[], _T]) -> _T:
+    """Run fn() with a small bounded retry for transient network failures
+    only: httpx.TransportError and its subclasses (ReadError, ConnectError,
+    WriteError, TimeoutException, RemoteProtocolError, ...) — errors that
+    happen before/without a PostgREST response. Application-level errors
+    (postgrest.exceptions.APIError — bad data, constraint violations,
+    validation) are never caught here and propagate on the first attempt,
+    since they are not transient and retrying them would just repeat the
+    same failure.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except httpx.TransportError:
+            attempt += 1
+            if attempt >= _TRANSIENT_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_TRANSIENT_RETRY_BACKOFF_SECONDS * attempt)
+
 
 # Columns owned by upsert_email()/get_email() — mirrors the canonical
 # EmailResult shape without importing it (models.py does not exist yet).
@@ -69,8 +102,8 @@ def _normalize_email_result(result: Any) -> dict:
 def get_email(email_id: str) -> dict | None:
     """Fetch one email row by email_id, or None if it does not exist."""
     client = get_supabase_client()
-    response = (
-        client.table("emails")
+    response = _call_with_retry(
+        lambda: client.table("emails")
         .select("*")
         .eq("email_id", email_id)
         .maybe_single()
@@ -83,8 +116,8 @@ def upsert_email(result: Any) -> dict:
     """Persist an email/result record (dict or Pydantic model) keyed by email_id."""
     row = _normalize_email_result(result)
     client = get_supabase_client()
-    response = (
-        client.table("emails")
+    response = _call_with_retry(
+        lambda: client.table("emails")
         .upsert(row, on_conflict="email_id")
         .execute()
     )
@@ -173,8 +206,8 @@ def upsert_email_source(
         "original_email_id": original_email_id,
     }
     client = get_supabase_client()
-    response = (
-        client.table("emails")
+    response = _call_with_retry(
+        lambda: client.table("emails")
         .upsert(row, on_conflict="email_id")
         .execute()
     )
@@ -219,8 +252,8 @@ def update_processing_state(
         updates["last_error"] = last_error
 
     client = get_supabase_client()
-    response = (
-        client.table("emails")
+    response = _call_with_retry(
+        lambda: client.table("emails")
         .update(updates)
         .eq("email_id", email_id)
         .execute()
@@ -272,8 +305,8 @@ def create_attachment_record(
         "size_bytes": size_bytes,
     }
     client = get_supabase_client()
-    response = (
-        client.table("attachments")
+    response = _call_with_retry(
+        lambda: client.table("attachments")
         .upsert(row, on_conflict="email_id,storage_path")
         .execute()
     )
@@ -283,8 +316,8 @@ def create_attachment_record(
 def list_attachments(email_id: str) -> list[dict]:
     """Return attachment rows belonging to the given email."""
     client = get_supabase_client()
-    response = (
-        client.table("attachments")
+    response = _call_with_retry(
+        lambda: client.table("attachments")
         .select("*")
         .eq("email_id", email_id)
         .order("created_at")
@@ -309,14 +342,14 @@ def upload_document(
         file_options["upsert"] = "true"
 
     client = get_supabase_client()
-    client.storage.from_(bucket).upload(storage_path, data, file_options or None)
+    _call_with_retry(lambda: client.storage.from_(bucket).upload(storage_path, data, file_options or None))
     return storage_path
 
 
 def download_document(storage_path: str, *, bucket: str = DOCUMENTS_BUCKET) -> bytes:
     """Download raw bytes of a private document by storage_path. No parsing, no classification."""
     client = get_supabase_client()
-    return client.storage.from_(bucket).download(storage_path)
+    return _call_with_retry(lambda: client.storage.from_(bucket).download(storage_path))
 
 
 def create_signed_document_url(
@@ -349,8 +382,8 @@ def create_batch(batch_id: str, *, total: int) -> dict:
         "finished_at": None,
     }
     client = get_supabase_client()
-    response = (
-        client.table("batches")
+    response = _call_with_retry(
+        lambda: client.table("batches")
         .upsert(row, on_conflict="batch_id")
         .execute()
     )
@@ -360,8 +393,8 @@ def create_batch(batch_id: str, *, total: int) -> dict:
 def get_batch(batch_id: str) -> dict | None:
     """Fetch one batch progress row by batch_id, or None if it does not exist."""
     client = get_supabase_client()
-    response = (
-        client.table("batches")
+    response = _call_with_retry(
+        lambda: client.table("batches")
         .select("*")
         .eq("batch_id", batch_id)
         .maybe_single()
@@ -393,8 +426,8 @@ def update_batch_progress(
         return get_batch(batch_id)
 
     client = get_supabase_client()
-    response = (
-        client.table("batches")
+    response = _call_with_retry(
+        lambda: client.table("batches")
         .update(updates)
         .eq("batch_id", batch_id)
         .execute()

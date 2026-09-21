@@ -14,8 +14,9 @@ import json
 import threading
 import unittest
 import zipfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 import database
@@ -1044,6 +1045,135 @@ class BundleUploadTests(unittest.TestCase):
         self.assertEqual(ids_from_a & ids_from_b, set())
         self.assertEqual(len(ids_from_a), 3)
         self.assertEqual(len(ids_from_b), 3)
+
+
+class BatchNetworkResilienceTests(unittest.TestCase):
+    """Regression coverage for batch-upload network resilience: transient
+    httpx/network failures (the "[WinError 10035] non-blocking socket
+    operation" httpx.ReadErrors seen during a real 520-email batch run,
+    where progress stalled at done=24, failed=2) must not stall the batch."""
+
+    def test_batch_worker_count_reduced_for_resilience(self):
+        self.assertLessEqual(main.BATCH_WORKERS, 2)
+        self.assertGreaterEqual(main.BATCH_WORKERS, 1)
+
+    def test_transient_read_error_during_upsert_email_source_recovers_via_retry(self):
+        # A single-record batch with no attachments isolates the retry
+        # behavior to database.upsert_email_source() itself: the fake
+        # Supabase client's execute() raises a transient httpx.ReadError
+        # exactly once, then succeeds.
+        records = [{
+            "email_id": "email_001", "from": "a@example.com",
+            "subject": "SI 1", "body": "body 1", "attachments": [],
+        }]
+        # An unreferenced attachments/ entry is needed only so
+        # _find_bundle_root() recognizes this zip as bundle-shaped; email_001
+        # itself has no attachments, keeping this test isolated to
+        # upsert_email_source()'s own retry behavior.
+        zip_bytes = _make_bundle_zip(records, {"attachments/unused.txt": b"x"})
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+
+        fake_client = MagicMock()
+        table_mock = fake_client.table.return_value
+        table_mock.upsert.return_value = table_mock
+        table_mock.eq.return_value = table_mock
+
+        calls = {"n": 0}
+
+        def flaky_execute():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadError(
+                    "[WinError 10035] non-blocking socket operation could not be completed immediately"
+                )
+            return MagicMock(data=[{"email_id": "batch_x__email_001"}])
+
+        table_mock.execute.side_effect = flaky_execute
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "get_supabase_client", return_value=fake_client), \
+             patch.object(database.time, "sleep"), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result) as mocked_process:
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls["n"], 2)  # one transient failure, one retry that succeeded
+
+        # The retry recovered transparently: the email was actually
+        # processed (not short-circuited into the failed bucket).
+        mocked_process.assert_called_once()
+        done_values = [c.kwargs.get("done") for c in mocked_progress.call_args_list if c.kwargs.get("done") is not None]
+        failed_values = [c.kwargs.get("failed") for c in mocked_progress.call_args_list if c.kwargs.get("failed") is not None]
+        self.assertEqual(done_values[-1], 1)
+        self.assertEqual(failed_values[-1], 0)
+        self.assertEqual(mocked_progress.call_args_list[-1].kwargs.get("status"), "completed")
+
+    def test_persistent_progress_update_failure_does_not_stall_the_batch(self):
+        # Simulates update_batch_progress() itself exhausting its own
+        # internal retries and still raising (e.g. a sustained outage) on
+        # the FIRST per-email progress write. The batch loop must keep
+        # going rather than aborting silently mid-batch.
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+
+        progress_calls = []
+
+        def flaky_progress(batch_id, **kwargs):
+            progress_calls.append(kwargs)
+            if len(progress_calls) == 1:
+                raise httpx.ReadError("still down")
+            return {"batch_id": batch_id, **kwargs}
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress", side_effect=flaky_progress), \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # Despite the very first progress write raising, the loop
+        # continued for the remaining emails and the batch still reached
+        # its final "completed" progress call.
+        statuses = [c.get("status") for c in progress_calls]
+        self.assertIn("completed", statuses)
+        self.assertGreater(len(progress_calls), 1)
+
+    def test_one_permanently_failing_email_increments_failed_and_batch_continues(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+
+        def flaky_process(email_id):
+            if email_id.endswith("email_002"):
+                # A network error whose retries are all exhausted inside
+                # database.py bubbles up through orchestration here.
+                raise httpx.ReadError("[WinError 10035] non-blocking socket operation could not be completed immediately")
+            return EmailResult(email_id=email_id, category="GENERAL", status="OK")
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", side_effect=flaky_process):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        done_values = [c.kwargs.get("done") for c in mocked_progress.call_args_list if c.kwargs.get("done") is not None]
+        failed_values = [c.kwargs.get("failed") for c in mocked_progress.call_args_list if c.kwargs.get("failed") is not None]
+        self.assertEqual(done_values[-1], 2)
+        self.assertEqual(failed_values[-1], 1)
+        self.assertEqual(mocked_progress.call_args_list[-1].kwargs.get("status"), "completed")
 
 
 class GetBatchEndpointTests(unittest.TestCase):
