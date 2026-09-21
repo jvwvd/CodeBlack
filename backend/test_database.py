@@ -12,6 +12,8 @@ Run from inside backend/:
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+import httpx
+
 import database
 
 # Captured immediately after import, before any test runs or patches
@@ -492,6 +494,145 @@ class EmailResultFieldsTests(unittest.TestCase):
             "reviewed_at", "reviewer_notes",
         }
         self.assertTrue(forbidden.isdisjoint(database._EMAIL_RESULT_FIELDS))
+
+
+class CallWithRetryTests(unittest.TestCase):
+    """Regression coverage for the batch-upload network-resilience fix:
+    _call_with_retry() must retry transient httpx/network failures (the
+    "[WinError 10035] non-blocking socket operation" httpx.ReadErrors seen
+    during real batch runs) with a small bounded backoff, but must never
+    retry a non-transient (application-level) error."""
+
+    def test_retries_transient_transport_error_then_succeeds(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ReadError("[WinError 10035] non-blocking socket operation could not be completed immediately")
+            return "ok"
+
+        with patch.object(database.time, "sleep") as mocked_sleep:
+            result = database._call_with_retry(flaky)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(mocked_sleep.call_count, 2)
+
+    def test_retry_is_bounded_and_reraises_after_exhausting_attempts(self):
+        calls = {"n": 0}
+
+        def always_fails():
+            calls["n"] += 1
+            raise httpx.ConnectError("still unreachable")
+
+        with patch.object(database.time, "sleep") as mocked_sleep:
+            with self.assertRaises(httpx.ConnectError):
+                database._call_with_retry(always_fails)
+
+        self.assertEqual(calls["n"], database._TRANSIENT_RETRY_ATTEMPTS)
+        self.assertEqual(mocked_sleep.call_count, database._TRANSIENT_RETRY_ATTEMPTS - 1)
+
+    def test_backoff_uses_small_increasing_delay(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.TimeoutException("timed out")
+            return "ok"
+
+        with patch.object(database.time, "sleep") as mocked_sleep:
+            database._call_with_retry(flaky)
+
+        delays = [call.args[0] for call in mocked_sleep.call_args_list]
+        self.assertEqual(delays, sorted(delays))  # non-decreasing backoff
+        self.assertLessEqual(max(delays), 1.0)  # small, bounded
+
+    def test_non_transient_error_is_never_retried(self):
+        calls = {"n": 0}
+
+        def fails_with_value_error():
+            calls["n"] += 1
+            raise ValueError("bad data, not a network problem")
+
+        with patch.object(database.time, "sleep") as mocked_sleep:
+            with self.assertRaises(ValueError):
+                database._call_with_retry(fails_with_value_error)
+
+        self.assertEqual(calls["n"], 1)
+        mocked_sleep.assert_not_called()
+
+
+class BatchFunctionsRetryOnTransientNetworkErrorTests(unittest.TestCase):
+    """The two functions named in the observed failure (database.
+    upsert_email_source, database.get_email), exercised end to end through
+    a fake Supabase client whose .execute() raises a transient httpx error
+    once before succeeding."""
+
+    def test_get_email_retries_transient_read_error_then_succeeds(self):
+        resp = MagicMock(data={"email_id": "email_001"})
+        client, table_mock = _fake_client_with_table_chain(resp)
+        calls = {"n": 0}
+
+        def flaky_execute():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise httpx.ReadError("[WinError 10035] non-blocking socket operation could not be completed immediately")
+            return resp
+
+        table_mock.execute.side_effect = flaky_execute
+
+        with patch.object(database, "get_supabase_client", return_value=client), \
+             patch.object(database.time, "sleep"):
+            result = database.get_email("email_001")
+
+        self.assertEqual(result, {"email_id": "email_001"})
+        self.assertEqual(calls["n"], 2)
+
+    def test_upsert_email_source_retries_transient_read_error_then_succeeds(self):
+        resp = MagicMock(data=[{"email_id": "batch_x__email_004"}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        calls = {"n": 0}
+
+        def flaky_execute():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise httpx.ReadError("[WinError 10035] non-blocking socket operation could not be completed immediately")
+            return resp
+
+        table_mock.execute.side_effect = flaky_execute
+
+        with patch.object(database, "get_supabase_client", return_value=client), \
+             patch.object(database.time, "sleep"):
+            result = database.upsert_email_source(
+                "batch_x__email_004", sender="a@b.com", subject="s", body="b",
+                source_attachments=[], batch_id="batch_x", original_email_id="email_004",
+            )
+
+        self.assertEqual(result, {"email_id": "batch_x__email_004"})
+        self.assertEqual(calls["n"], 2)
+
+    def test_upsert_email_source_does_not_retry_on_application_error(self):
+        # A non-network error (e.g. a constraint violation) must propagate
+        # immediately -- never retried, per "do not retry validation/4xx
+        # logic errors".
+        client, table_mock = _fake_client_with_table_chain(None)
+        calls = {"n": 0}
+
+        def fails(*_a, **_k):
+            calls["n"] += 1
+            raise ValueError("simulated 23503 foreign key violation")
+
+        table_mock.execute.side_effect = fails
+
+        with patch.object(database, "get_supabase_client", return_value=client), \
+             patch.object(database.time, "sleep") as mocked_sleep:
+            with self.assertRaises(ValueError):
+                database.upsert_email_source("email_004", sender="a", subject="s", body="b")
+
+        self.assertEqual(calls["n"], 1)
+        mocked_sleep.assert_not_called()
 
 
 if __name__ == "__main__":

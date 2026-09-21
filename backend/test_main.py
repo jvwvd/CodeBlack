@@ -11,10 +11,12 @@ Run from inside backend/:
 """
 import io
 import json
+import threading
 import unittest
 import zipfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 import database
@@ -755,6 +757,123 @@ class UploadEmailEndpointTests(unittest.TestCase):
         mocked_get.assert_called_once()
 
 
+class UploadForeignKeyOrderingTests(unittest.TestCase):
+    """Regression coverage for the upload FK-ordering bug: the parent
+    `emails` row must be persisted via database.upsert_email_source()
+    before any database.create_attachment_record() call for that same
+    email_id, since attachments.email_id has a foreign key onto
+    emails.email_id (Postgres 23503 otherwise). Covers all three upload
+    paths that store attachments: plain multipart files, .eml, and the
+    organizer-bundle/batch path."""
+
+    def test_plain_attachment_upload_creates_parent_row_before_attachment_records(self):
+        call_order: list[str] = []
+        fake_result = EmailResult(email_id="placeholder", category="SI_REQUEST", status="OK")
+
+        def record_source(*args, **kwargs):
+            call_order.append("upsert_email_source")
+            return {"email_id": args[0] if args else kwargs.get("email_id")}
+
+        def record_attachment(*args, **kwargs):
+            call_order.append("create_attachment_record")
+
+        with patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record", side_effect=record_attachment), \
+             patch.object(database, "upsert_email_source", side_effect=record_source), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test SI/BL", "body": "please verify"},
+                files=[
+                    ("files", ("si.txt", b"SI content", "text/plain")),
+                    ("files", ("bl.txt", b"BL content", "text/plain")),
+                ],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(len(call_order), 3)
+        self.assertEqual(call_order[0], "upsert_email_source")
+        self.assertNotIn("create_attachment_record", call_order[: call_order.index("upsert_email_source") + 1])
+
+    def test_eml_upload_creates_parent_row_before_attachment_records(self):
+        eml_bytes = (
+            b"From: sender@example.com\r\n"
+            b"Subject: Please verify BL\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+            b"\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"Please compare the attached SI and BL.\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b'Content-Disposition: attachment; filename="si.txt"\r\n'
+            b"\r\n"
+            b"SI content\r\n"
+            b"--BOUNDARY--\r\n"
+        )
+        call_order: list[str] = []
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+
+        with patch.object(database, "upload_document"), \
+             patch.object(
+                 database, "create_attachment_record",
+                 side_effect=lambda *a, **k: call_order.append("create_attachment_record"),
+             ), \
+             patch.object(
+                 database, "upsert_email_source",
+                 side_effect=lambda *a, **k: call_order.append("upsert_email_source") or {"email_id": a[0]},
+             ), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("incoming.eml", eml_bytes, "message/rfc822"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(call_order, ["upsert_email_source", "create_attachment_record"])
+
+    def test_bundle_upload_creates_parent_row_before_attachment_records_per_email(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+
+        # Track ordering PER composite email_id, since the batch runs several
+        # emails concurrently across worker threads -- the FK constraint is
+        # per email_id, so what matters is that each email's own
+        # upsert_email_source() call precedes its own create_attachment_record()
+        # call(s), not a single global order across the whole batch.
+        events: dict[str, list[str]] = {}
+        lock = threading.Lock()
+
+        def record_source(email_id, *args, **kwargs):
+            with lock:
+                events.setdefault(email_id, []).append("upsert_email_source")
+            return {"email_id": email_id}
+
+        def record_attachment(email_id, *args, **kwargs):
+            with lock:
+                events.setdefault(email_id, []).append("create_attachment_record")
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress"), \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record", side_effect=record_attachment), \
+             patch.object(database, "upsert_email_source", side_effect=record_source), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # email_001 and email_002 each have exactly one attachment.
+        emails_with_attachments = [eid for eid in events if eid.endswith("email_001") or eid.endswith("email_002")]
+        self.assertEqual(len(emails_with_attachments), 2)
+        for email_id in emails_with_attachments:
+            self.assertEqual(events[email_id], ["upsert_email_source", "create_attachment_record"])
+
+
 def _make_zip(entries: dict) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -1095,6 +1214,135 @@ class BundleUploadTests(unittest.TestCase):
         self.assertEqual(ids_from_a & ids_from_b, set())
         self.assertEqual(len(ids_from_a), 3)
         self.assertEqual(len(ids_from_b), 3)
+
+
+class BatchNetworkResilienceTests(unittest.TestCase):
+    """Regression coverage for batch-upload network resilience: transient
+    httpx/network failures (the "[WinError 10035] non-blocking socket
+    operation" httpx.ReadErrors seen during a real 520-email batch run,
+    where progress stalled at done=24, failed=2) must not stall the batch."""
+
+    def test_batch_worker_count_reduced_for_resilience(self):
+        self.assertLessEqual(main.BATCH_WORKERS, 2)
+        self.assertGreaterEqual(main.BATCH_WORKERS, 1)
+
+    def test_transient_read_error_during_upsert_email_source_recovers_via_retry(self):
+        # A single-record batch with no attachments isolates the retry
+        # behavior to database.upsert_email_source() itself: the fake
+        # Supabase client's execute() raises a transient httpx.ReadError
+        # exactly once, then succeeds.
+        records = [{
+            "email_id": "email_001", "from": "a@example.com",
+            "subject": "SI 1", "body": "body 1", "attachments": [],
+        }]
+        # An unreferenced attachments/ entry is needed only so
+        # _find_bundle_root() recognizes this zip as bundle-shaped; email_001
+        # itself has no attachments, keeping this test isolated to
+        # upsert_email_source()'s own retry behavior.
+        zip_bytes = _make_bundle_zip(records, {"attachments/unused.txt": b"x"})
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+
+        fake_client = MagicMock()
+        table_mock = fake_client.table.return_value
+        table_mock.upsert.return_value = table_mock
+        table_mock.eq.return_value = table_mock
+
+        calls = {"n": 0}
+
+        def flaky_execute():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadError(
+                    "[WinError 10035] non-blocking socket operation could not be completed immediately"
+                )
+            return MagicMock(data=[{"email_id": "batch_x__email_001"}])
+
+        table_mock.execute.side_effect = flaky_execute
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "get_supabase_client", return_value=fake_client), \
+             patch.object(database.time, "sleep"), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result) as mocked_process:
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls["n"], 2)  # one transient failure, one retry that succeeded
+
+        # The retry recovered transparently: the email was actually
+        # processed (not short-circuited into the failed bucket).
+        mocked_process.assert_called_once()
+        done_values = [c.kwargs.get("done") for c in mocked_progress.call_args_list if c.kwargs.get("done") is not None]
+        failed_values = [c.kwargs.get("failed") for c in mocked_progress.call_args_list if c.kwargs.get("failed") is not None]
+        self.assertEqual(done_values[-1], 1)
+        self.assertEqual(failed_values[-1], 0)
+        self.assertEqual(mocked_progress.call_args_list[-1].kwargs.get("status"), "completed")
+
+    def test_persistent_progress_update_failure_does_not_stall_the_batch(self):
+        # Simulates update_batch_progress() itself exhausting its own
+        # internal retries and still raising (e.g. a sustained outage) on
+        # the FIRST per-email progress write. The batch loop must keep
+        # going rather than aborting silently mid-batch.
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+
+        progress_calls = []
+
+        def flaky_progress(batch_id, **kwargs):
+            progress_calls.append(kwargs)
+            if len(progress_calls) == 1:
+                raise httpx.ReadError("still down")
+            return {"batch_id": batch_id, **kwargs}
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress", side_effect=flaky_progress), \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # Despite the very first progress write raising, the loop
+        # continued for the remaining emails and the batch still reached
+        # its final "completed" progress call.
+        statuses = [c.get("status") for c in progress_calls]
+        self.assertIn("completed", statuses)
+        self.assertGreater(len(progress_calls), 1)
+
+    def test_one_permanently_failing_email_increments_failed_and_batch_continues(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+
+        def flaky_process(email_id):
+            if email_id.endswith("email_002"):
+                # A network error whose retries are all exhausted inside
+                # database.py bubbles up through orchestration here.
+                raise httpx.ReadError("[WinError 10035] non-blocking socket operation could not be completed immediately")
+            return EmailResult(email_id=email_id, category="GENERAL", status="OK")
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", side_effect=flaky_process):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        done_values = [c.kwargs.get("done") for c in mocked_progress.call_args_list if c.kwargs.get("done") is not None]
+        failed_values = [c.kwargs.get("failed") for c in mocked_progress.call_args_list if c.kwargs.get("failed") is not None]
+        self.assertEqual(done_values[-1], 2)
+        self.assertEqual(failed_values[-1], 1)
+        self.assertEqual(mocked_progress.call_args_list[-1].kwargs.get("status"), "completed")
 
 
 class GetBatchEndpointTests(unittest.TestCase):

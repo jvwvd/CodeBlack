@@ -93,7 +93,9 @@ ZIP_MAX_FILES = 50
 ZIP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 
 BATCH_ID_PREFIX = "batch_"
-BATCH_WORKERS = 3
+BATCH_WORKERS = 2  # reduced from 3: lower concurrency on the shared Supabase
+# client materially reduces transient "[WinError 10035] non-blocking socket
+# operation" httpx.ReadErrors observed during real batch runs.
 BUNDLE_MAX_FILES = 5000
 BUNDLE_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 BUNDLE_MAX_UPLOAD_BYTES = MAX_UPLOAD_TOTAL_BYTES  # 100MB, same ceiling as a generic request
@@ -507,14 +509,17 @@ def _create_email_from_attachments(
     NOT an upload-time error — the pipeline marks that email NEEDS_REVIEW/
     unreadable downstream, which is the expected outcome."""
     email_id = f"{UPLOAD_ID_PREFIX}{uuid.uuid4().hex[:12]}"
-    filenames: list[str] = []
-    for filename, data, kind in entries:
-        _store_attachment(email_id, filename, data, kind)
-        filenames.append(filename)
+    filenames = [filename for filename, _, _ in entries]
 
+    # Parent row must exist before any attachment row references it
+    # (attachments.email_id -> emails.email_id foreign key).
     database.upsert_email_source(
         email_id, sender=sender, subject=subject, body=body, source_attachments=filenames
     )
+
+    for filename, data, kind in entries:
+        _store_attachment(email_id, filename, data, kind)
+
     return _process_new_email(email_id)
 
 
@@ -534,7 +539,8 @@ def _create_email_from_eml(data: bytes):
             body_text = ""
 
     email_id = f"{UPLOAD_ID_PREFIX}{uuid.uuid4().hex[:12]}"
-    filenames: list[str] = []
+
+    attachments: list[tuple[str, bytes, str]] = []
     for index, part in enumerate(msg.iter_attachments(), start=1):
         raw_name = part.get_filename() or f"attachment_{index}"
         att_name = _sanitize_upload_filename(raw_name)
@@ -546,12 +552,19 @@ def _create_email_from_eml(data: bytes):
             att_data = att_data.encode("utf-8", errors="replace")
         elif not isinstance(att_data, (bytes, bytearray)):
             continue
-        _store_attachment(email_id, att_name, bytes(att_data), _sniff_file_kind(att_name, bytes(att_data)))
-        filenames.append(att_name)
+        att_data = bytes(att_data)
+        attachments.append((att_name, att_data, _sniff_file_kind(att_name, att_data)))
 
+    # Parent row must exist before any attachment row references it
+    # (attachments.email_id -> emails.email_id foreign key).
     database.upsert_email_source(
-        email_id, sender=sender, subject=subject, body=body_text, source_attachments=filenames
+        email_id, sender=sender, subject=subject, body=body_text,
+        source_attachments=[name for name, _, _ in attachments],
     )
+
+    for att_name, att_data, kind in attachments:
+        _store_attachment(email_id, att_name, att_data, kind)
+
     return _process_new_email(email_id)
 
 
@@ -590,15 +603,9 @@ def _run_batch(batch_id: str, root: str, records: list[dict], attachment_cache: 
         composite_id = f"{batch_id}__{original_id}"
         try:
             attachments = record.get("attachments") or []
-            for att_path in attachments:
-                zip_path = root + att_path
-                data = attachment_cache.get(zip_path)
-                if data is None:
-                    continue
-                basename = PurePosixPath(att_path).name
-                kind = _sniff_file_kind(basename, data)
-                _store_attachment(composite_id, basename, data, kind)
 
+            # Parent row must exist before any attachment row references it
+            # (attachments.email_id -> emails.email_id foreign key).
             database.upsert_email_source(
                 composite_id,
                 sender=record.get("from"),
@@ -608,6 +615,16 @@ def _run_batch(batch_id: str, root: str, records: list[dict], attachment_cache: 
                 batch_id=batch_id,
                 original_email_id=original_id,
             )
+
+            for att_path in attachments:
+                zip_path = root + att_path
+                data = attachment_cache.get(zip_path)
+                if data is None:
+                    continue
+                basename = PurePosixPath(att_path).name
+                kind = _sniff_file_kind(basename, data)
+                _store_attachment(composite_id, basename, data, kind)
+
             orchestration.process_and_persist_email(composite_id)
             return True
         except Exception:
@@ -623,9 +640,23 @@ def _run_batch(batch_id: str, root: str, records: list[dict], attachment_cache: 
                     done += 1
                 else:
                     failed += 1
-                database.update_batch_progress(batch_id, done=done, failed=failed)
+                # database.update_batch_progress() already retries transient
+                # network failures internally; if it still raises (e.g. a
+                # sustained outage), that must not abort this loop and
+                # silently stall the rest of the batch -- done/failed simply
+                # keep advancing in memory and the next successful write
+                # catches the progress row up.
+                try:
+                    database.update_batch_progress(batch_id, done=done, failed=failed)
+                except Exception:
+                    logger.exception(
+                        "batch %s: failed to persist progress (done=%s failed=%s)", batch_id, done, failed
+                    )
 
-    database.update_batch_progress(batch_id, status="completed", finished=True)
+    try:
+        database.update_batch_progress(batch_id, status="completed", finished=True)
+    except Exception:
+        logger.exception("batch %s: failed to persist final completed status", batch_id)
 
 
 def _handle_bundle_upload(zf: zipfile.ZipFile, root: str, background_tasks: BackgroundTasks) -> dict:
