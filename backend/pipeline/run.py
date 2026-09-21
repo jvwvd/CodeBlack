@@ -60,6 +60,20 @@ def process_email(
             decided_by=decided_by,
         ))
 
+    if si_text is None and bl_text is None:
+        # No attachments were sent and the email itself made no claim that
+        # a document pair exists to compare (reliability.check() already
+        # declined to escalate this) -- e.g. "please send the draft BL for
+        # checking" with nothing attached yet. Nothing to extract or
+        # compare; this is a clean pass-through, not a review case.
+        return _finalize(EmailResult(
+            email_id=email["email_id"],
+            category=category,
+            status="OK",
+            decided_by=decided_by,
+            notes="No attachments to compare.",
+        ))
+
     si = extract.extract_fields(si_text)
     bl = extract.extract_fields(bl_text)
 

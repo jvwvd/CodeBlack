@@ -1,11 +1,12 @@
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 import pymupdf
 from docx import Document
 from openpyxl import Workbook
-from io import BytesIO
 
+from pipeline import reliability
 from pipeline.classify import classify_email
 from pipeline.documents import (
     identify_doc_type,
@@ -243,6 +244,68 @@ class PipelineRegressionTests(unittest.TestCase):
         mock_vision.assert_called_once()
         self.assertIsNone(text)
 
+    def test_si_request_subject_beats_invoice_text_in_body(self):
+        body = """
+        Please find the shipping instruction attached.
+
+        Documents Required:
+        1) 3 Original invoice
+        2) Packing list
+        3) Original BL
+
+        Forwarded thread also mentions billing and payment.
+        """
+
+        subjects = (
+            "CUST SI _ MEA _ 5RCY-52735 __ PO_25_5465",
+            "RE_ CUST SI _ MEA _ 5RCY-51168 __ PO_25_3508",
+            "REQUEST SI _ 5APH-62718 _ HOUSTON_US",
+            "RE_ REQUEST SI _ 5RCY-60883 _ CONAKRY_GUINEA",
+            "SI NEEDED_ 5RUS-16202 _ EAST BRIGHT",
+            "RE_ SI NEEDED_ 5APH-26773 _ UAB NOVAKOPA",
+            "SI - HLCUSIN331541006 - DIRECT(HAPAG) - 5RUS-61793",
+            "RE_ SI - SIJ3777014 - DIRECT(CMA) - 5ALT-88568",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                email = {
+                    "email_id": "email_test_si_request",
+                    "from": "ops@example.com",
+                    "subject": subject,
+                    "body": body,
+                    "attachments": [],
+                }
+
+                category, decided_by = classify_email(email)
+
+                self.assertEqual(category, "SI_REQUEST")
+                self.assertEqual(decided_by, "rule")
+
+    def test_documented_invoice_subject_signals(self):
+        subjects = (
+            "REQUEST TO CANCEL INVOICE -5250075802",
+            "RE_ LOCAL CHARGES FOB - KARGOSMAR - TELEX RELEASE CHARGES",
+            "2157 RAK BILLING 5070146693 MISSING GR",
+            "_RPA_ India HSS SD Billing Process Completed - VISION",
+            "Mill D & D charges - 6437419230",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                email = {
+                    "email_id": "email_test_invoice",
+                    "from": "ops@example.com",
+                    "subject": subject,
+                    "body": "Normal forwarded operational thread.",
+                    "attachments": [],
+                }
+
+                category, decided_by = classify_email(email)
+
+                self.assertEqual(category, "INVOICE_QUERY")
+                self.assertEqual(decided_by, "rule")
+
 
 SI_TEXT_MISSING_WEIGHT = """
 SHIPPING INSTRUCTION
@@ -375,6 +438,204 @@ class DefectReviewInvariantTests(unittest.TestCase):
         self.assertEqual(result.status, "MISMATCH")
         self.assertTrue(result.has_defect)
         self.assertEqual(result.defect_fields, ["shipper"])
+
+
+WRONG_DOC_TEXT = """
+COMMERCIAL INVOICE
+
+Invoice No.: INV-2026-001
+Seller: TEST EXPORTER LTD
+Buyer: TEST IMPORTER SDN BHD
+
+*** THIS IS A COMMERCIAL INVOICE - NOT A SHIPPING INSTRUCTION ***
+"""
+
+COMPARISON_SUBJECT = "TO CONFIRM DOCS _ Please check draft BL against shipping instruction"
+COMPARISON_BODY = "Please verify the shipping instruction against the draft bill of lading."
+
+SEND_DRAFT_BL_SUBJECT = "REQUEST BL DRAFT _ PO 25041 _ PAPERONE DIGITAL COPIER PAPER"
+SEND_DRAFT_BL_BODY = "Dear Team,\n\nPlease assist to send the draft BL for booking 070500208599 for checking asap.\n\nThank you."
+
+COMPARE_NO_ATTACHMENT_BODY = (
+    "Dear Team,\n\nPlease compare the SI and draft BL for 070500263211 and confirm "
+    "(attachments appear to have been dropped). Thank you."
+)
+
+
+class MissingAttachmentReliabilityTests(unittest.TestCase):
+    """Regression coverage for the missing_attachment over-triggering bug:
+    reliability.check() used to treat ANY BL_COMPARISON email with fewer
+    than 2 attachment references as a genuinely missing document, which
+    also flagged ordinary "please send the draft BL" requests (which never
+    had attachments to begin with -- see the organizer README: emails with
+    no attachments are a normal, expected case, not a review case)."""
+
+    # -- direct unit coverage of reliability.check() -----------------------
+
+    def test_zero_attachments_without_si_reference_is_not_missing_attachment(self):
+        email = {
+            "email_id": "email_send_bl",
+            "subject": SEND_DRAFT_BL_SUBJECT,
+            "body": SEND_DRAFT_BL_BODY,
+            "attachments": [],
+        }
+        self.assertIsNone(reliability.check(email, None, None))
+
+    def test_zero_attachments_with_si_reference_is_missing_attachment(self):
+        email = {
+            "email_id": "email_dropped",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARE_NO_ATTACHMENT_BODY,
+            "attachments": [],
+        }
+        self.assertEqual(reliability.check(email, None, None), "missing_attachment")
+
+    def test_one_attachment_is_always_missing_attachment(self):
+        email = {
+            "email_id": "email_partial",
+            "subject": SEND_DRAFT_BL_SUBJECT,
+            "body": SEND_DRAFT_BL_BODY,  # no SI reference at all
+            "attachments": ["attachments/si.txt"],
+        }
+        # Partial (exactly one of two required documents) is always genuine,
+        # regardless of whether the email text happens to mention "SI".
+        self.assertEqual(reliability.check(email, SI_TEXT, None), "missing_attachment")
+
+    # -- end-to-end process_email() coverage --------------------------------
+
+    def test_1_genuine_missing_attachment_only_one_physical_document(self):
+        email = {
+            "email_id": "email_test_one_doc",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARISON_BODY,
+            "attachments": ["attachments/si.txt"],
+        }
+        attachment_bytes = {"attachments/si.txt": SI_TEXT.encode()}
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "NEEDS_REVIEW")
+        self.assertEqual(result.review_reason, "missing_attachment")
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_2_weak_filenames_with_identifiable_content_not_missing_attachment(self):
+        email = {
+            "email_id": "email_test_weak_filenames",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARISON_BODY,
+            "attachments": ["attachments/doc1.txt", "attachments/doc2.txt"],
+        }
+        attachment_bytes = {
+            "attachments/doc1.txt": SI_TEXT.encode(),
+            "attachments/doc2.txt": BL_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertNotEqual(result.review_reason, "missing_attachment")
+        self.assertEqual(result.status, "OK")
+        self.assertIsNone(result.review_reason)
+
+    def test_3_two_files_wrong_doc_type_not_missing_attachment(self):
+        email = {
+            "email_id": "email_test_wrong_doc",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARISON_BODY,
+            "attachments": ["attachments/si.txt", "attachments/invoice.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT.encode(),
+            "attachments/invoice.txt": WRONG_DOC_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.review_reason, "wrong_doc_type")
+        self.assertNotEqual(result.review_reason, "missing_attachment")
+        self.assertEqual(result.status, "NEEDS_REVIEW")
+
+    def test_4_unreadable_file_not_missing_attachment(self):
+        email = {
+            "email_id": "email_test_unreadable",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARISON_BODY,
+            "attachments": ["attachments/si.txt", "attachments/bl.pdf"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT.encode(),
+            "attachments/bl.pdf": b"not a real pdf, will not open",
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.review_reason, "unreadable")
+        self.assertNotEqual(result.review_reason, "missing_attachment")
+        self.assertEqual(result.status, "NEEDS_REVIEW")
+
+    def test_5_valid_si_and_bl_proceeds_normally(self):
+        email = {
+            "email_id": "email_test_valid_pair",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARISON_BODY,
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT.encode(),
+            "attachments/bl.txt": BL_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertIsNone(result.review_reason)
+        self.assertEqual(result.status, "OK")
+        self.assertIsNotNone(result.si)
+        self.assertIsNotNone(result.bl)
+
+    def test_6_no_attachments_no_si_reference_resolves_ok_not_review(self):
+        # The core regression: a plain "please send the draft BL" request
+        # (no attachments, no mention of an SI to compare against) must
+        # resolve cleanly, not be escalated as a missing attachment.
+        email = {
+            "email_id": "email_test_send_bl_only",
+            "from": "ops@example.com",
+            "subject": SEND_DRAFT_BL_SUBJECT,
+            "body": SEND_DRAFT_BL_BODY,
+            "attachments": [],
+        }
+
+        with patch("pipeline.classify.classify_with_llm", return_value="BL_COMPARISON"):
+            result = process_email(email, attachment_bytes={})
+
+        self.assertEqual(result.category, "BL_COMPARISON")
+        self.assertEqual(result.status, "OK")
+        self.assertIsNone(result.review_reason)
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_7_no_attachments_with_si_reference_still_needs_review(self):
+        # Genuine missing-attachment behavior must be preserved: a
+        # comparison explicitly requested with nothing attached still
+        # escalates, even with zero physical attachments.
+        email = {
+            "email_id": "email_test_dropped_attachments",
+            "from": "ops@example.com",
+            "subject": COMPARISON_SUBJECT,
+            "body": COMPARE_NO_ATTACHMENT_BODY,
+            "attachments": [],
+        }
+
+        result = process_email(email, attachment_bytes={})
+
+        self.assertEqual(result.status, "NEEDS_REVIEW")
+        self.assertEqual(result.review_reason, "missing_attachment")
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
 
 
 if __name__ == "__main__":
