@@ -61,6 +61,7 @@ def extract_fields(text: str) -> ShipmentFields:
         (
             r"^\s*Consignee(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Consignee(?:\s*\([^)]*\))*\s*$\n\s*([^|\n]+)",
+            r"^\s*To the Order of\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*To the Order of\s*$\n\s*([^|\n]+)",
         ),
     )
@@ -79,6 +80,7 @@ def extract_fields(text: str) -> ShipmentFields:
         (
             r"^\s*Port of Loading(?:\s*\(POL\))?(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*POL(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
+            r"^\s*Load Port\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Load Port\s*$\n\s*([^|\n]+)",
         ),
     )
@@ -107,6 +109,7 @@ def extract_fields(text: str) -> ShipmentFields:
         (
             r"^\s*Gross\s*Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Total Gross Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
+            r"^\s*Gross\s*Wt[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
         ),
     )
 
