@@ -10,7 +10,7 @@ Run from inside backend/:
     python -m unittest -v test_database
 """
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import database
 
@@ -23,7 +23,7 @@ def _fake_client_with_table_chain(execute_return):
     """A MagicMock client whose table(...).<chain>.execute() returns execute_return."""
     client = MagicMock()
     table_mock = client.table.return_value
-    for method in ("select", "eq", "upsert", "update", "order", "limit", "maybe_single"):
+    for method in ("select", "eq", "upsert", "update", "order", "limit", "range", "maybe_single"):
         getattr(table_mock, method).return_value = table_mock
     table_mock.execute.return_value = execute_return
     return client, table_mock
@@ -222,8 +222,13 @@ class ListEmailsTests(unittest.TestCase):
             result = database.list_emails()
         self.assertEqual(result, [])
         table_mock.eq.assert_not_called()
-        table_mock.order.assert_called_once_with("created_at", desc=True)
-        table_mock.limit.assert_called_once_with(100)
+        # Deterministic sort: created_at desc, then email_id asc as a
+        # tie-breaker, so pagination pages never overlap or skip rows.
+        self.assertEqual(
+            table_mock.order.call_args_list,
+            [call("created_at", desc=True), call("email_id", desc=False)],
+        )
+        table_mock.range.assert_called_once_with(0, 99)
 
     def test_category_filter(self):
         resp = MagicMock(data=[{"email_id": "e1"}])
@@ -252,7 +257,7 @@ class ListEmailsTests(unittest.TestCase):
         client, table_mock = _fake_client_with_table_chain(resp)
         with patch.object(database, "get_supabase_client", return_value=client):
             database.list_emails(limit=5)
-        table_mock.limit.assert_called_once_with(5)
+        table_mock.range.assert_called_once_with(0, 4)
 
     def test_batch_id_filter(self):
         resp = MagicMock(data=[])
@@ -260,6 +265,13 @@ class ListEmailsTests(unittest.TestCase):
         with patch.object(database, "get_supabase_client", return_value=client):
             database.list_emails(batch_id="batch_abc")
         table_mock.eq.assert_called_once_with("batch_id", "batch_abc")
+
+    def test_offset_applies_range(self):
+        resp = MagicMock(data=[])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.list_emails(limit=20, offset=40)
+        table_mock.range.assert_called_once_with(40, 59)
 
 
 class BatchHelperTests(unittest.TestCase):

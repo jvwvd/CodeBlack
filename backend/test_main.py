@@ -35,37 +35,206 @@ class HealthEndpointTests(unittest.TestCase):
 class ListEmailsEndpointTests(unittest.TestCase):
     def test_default_call_returns_items_and_count(self):
         fake_rows = [{"email_id": "email_001"}, {"email_id": "email_002"}]
-        with patch.object(database, "list_emails", return_value=fake_rows) as mocked:
+        with patch.object(database, "list_emails", return_value=fake_rows) as mocked, \
+             patch.object(database, "count_emails", return_value=2):
             response = client.get("/api/emails")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"items": fake_rows, "count": 2})
-        mocked.assert_called_once_with(status=None, category=None, processing_status=None, limit=100)
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=100, offset=0
+        )
 
     def test_empty_result_is_valid(self):
-        with patch.object(database, "list_emails", return_value=[]):
+        with patch.object(database, "list_emails", return_value=[]), \
+             patch.object(database, "count_emails", return_value=0):
             response = client.get("/api/emails")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"items": [], "count": 0})
 
     def test_category_filter_passed_through(self):
-        with patch.object(database, "list_emails", return_value=[]) as mocked:
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
             client.get("/api/emails?category=BL_COMPARISON")
-        mocked.assert_called_once_with(status=None, category="BL_COMPARISON", processing_status=None, limit=100)
+        mocked.assert_called_once_with(
+            status=None, category="BL_COMPARISON", processing_status=None, batch_id=None, limit=100, offset=0
+        )
 
     def test_status_filter_passed_through(self):
-        with patch.object(database, "list_emails", return_value=[]) as mocked:
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
             client.get("/api/emails?status=NEEDS_REVIEW")
-        mocked.assert_called_once_with(status="NEEDS_REVIEW", category=None, processing_status=None, limit=100)
+        mocked.assert_called_once_with(
+            status="NEEDS_REVIEW", category=None, processing_status=None, batch_id=None, limit=100, offset=0
+        )
 
     def test_processing_status_filter_passed_through(self):
-        with patch.object(database, "list_emails", return_value=[]) as mocked:
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
             client.get("/api/emails?processing_status=failed")
-        mocked.assert_called_once_with(status=None, category=None, processing_status="failed", limit=100)
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status="failed", batch_id=None, limit=100, offset=0
+        )
 
     def test_limit_passed_through(self):
-        with patch.object(database, "list_emails", return_value=[]) as mocked:
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
             client.get("/api/emails?limit=5")
-        mocked.assert_called_once_with(status=None, category=None, processing_status=None, limit=5)
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=5, offset=0
+        )
+
+    def test_invalid_limit_behaviour_is_unchanged(self):
+        # limit has no FastAPI-level validation today (plain `int`), and
+        # that is deliberately preserved: a non-numeric value still 422s
+        # (type coercion failure), but an out-of-range int (e.g. negative
+        # or huge) is still passed straight through to database.list_emails()
+        # rather than being newly rejected here.
+        response = client.get("/api/emails?limit=notanumber")
+        self.assertEqual(response.status_code, 422)
+
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            response = client.get("/api/emails?limit=-5")
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=-5, offset=0
+        )
+
+    def test_batch_id_filter_passed_through(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            client.get("/api/emails?batch_id=batch_abc")
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id="batch_abc", limit=100, offset=0
+        )
+
+    def test_batch_id_combined_with_status_and_category(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            client.get("/api/emails?batch_id=batch_abc&status=MISMATCH&category=BL_COMPARISON")
+        mocked.assert_called_once_with(
+            status="MISMATCH", category="BL_COMPARISON", processing_status=None,
+            batch_id="batch_abc", limit=100, offset=0,
+        )
+
+    def test_offset_zero_passed_through(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            client.get("/api/emails?offset=0")
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=100, offset=0
+        )
+
+    def test_offset_in_the_middle_passed_through(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            client.get("/api/emails?offset=40&limit=20")
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=20, offset=40
+        )
+
+    def test_offset_exactly_at_end_returns_empty_list(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=50):
+            response = client.get("/api/emails?offset=50&limit=20")
+        self.assertEqual(response.json(), {"items": [], "count": 0})
+        self.assertEqual(response.headers["x-total-count"], "50")
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=20, offset=50
+        )
+
+    def test_offset_beyond_end_returns_empty_list(self):
+        with patch.object(database, "list_emails", return_value=[]), \
+             patch.object(database, "count_emails", return_value=5):
+            response = client.get("/api/emails?offset=999")
+        self.assertEqual(response.json(), {"items": [], "count": 0})
+
+    def test_limit_larger_than_remaining_rows_returns_what_exists(self):
+        fake_rows = [{"email_id": "email_048"}, {"email_id": "email_049"}]
+        with patch.object(database, "list_emails", return_value=fake_rows) as mocked, \
+             patch.object(database, "count_emails", return_value=50):
+            response = client.get("/api/emails?offset=48&limit=100")
+        self.assertEqual(response.json(), {"items": fake_rows, "count": 2})
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=100, offset=48
+        )
+
+    def test_batch_id_combined_with_pagination(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked, \
+             patch.object(database, "count_emails", return_value=0):
+            client.get("/api/emails?batch_id=batch_xyz&offset=10&limit=5")
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id="batch_xyz", limit=5, offset=10
+        )
+
+    def test_negative_offset_returns_422(self):
+        response = client.get("/api/emails?offset=-1")
+        self.assertEqual(response.status_code, 422)
+
+    def test_x_total_count_header_reflects_full_count_not_page_size(self):
+        fake_rows = [{"email_id": "email_001"}]
+        with patch.object(database, "list_emails", return_value=fake_rows), \
+             patch.object(database, "count_emails", return_value=137) as mocked_count:
+            response = client.get("/api/emails?limit=1&offset=0")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-total-count"], "137")
+        self.assertEqual(len(response.json()["items"]), 1)
+        mocked_count.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None
+        )
+
+    def test_x_total_count_header_applies_same_filters_as_items(self):
+        with patch.object(database, "list_emails", return_value=[]), \
+             patch.object(database, "count_emails", return_value=5) as mocked_count:
+            client.get("/api/emails?status=MISMATCH&batch_id=batch_xyz")
+        mocked_count.assert_called_once_with(
+            status="MISMATCH", category=None, processing_status=None, batch_id="batch_xyz"
+        )
+
+    def test_cors_exposes_x_total_count_header(self):
+        with patch.object(database, "list_emails", return_value=[]), \
+             patch.object(database, "count_emails", return_value=0):
+            response = client.get(
+                "/api/emails", headers={"Origin": "http://localhost:5173"}
+            )
+        exposed = response.headers.get("access-control-expose-headers", "")
+        self.assertIn("X-Total-Count", exposed)
+
+
+class CountEmailsEndpointTests(unittest.TestCase):
+    def test_default_call_returns_total(self):
+        with patch.object(database, "count_emails", return_value=42) as mocked:
+            response = client.get("/api/emails/count")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"total": 42})
+        mocked.assert_called_once_with(status=None, category=None, processing_status=None, batch_id=None)
+
+    def test_batch_id_filter_passed_through(self):
+        with patch.object(database, "count_emails", return_value=3) as mocked:
+            response = client.get("/api/emails/count?batch_id=batch_abc")
+        self.assertEqual(response.json(), {"total": 3})
+        mocked.assert_called_once_with(status=None, category=None, processing_status=None, batch_id="batch_abc")
+
+    def test_status_and_category_filters_passed_through(self):
+        with patch.object(database, "count_emails", return_value=0) as mocked:
+            client.get("/api/emails/count?status=OK&category=SPAM")
+        mocked.assert_called_once_with(status="OK", category="SPAM", processing_status=None, batch_id=None)
+
+    def test_matches_list_emails_count_with_same_filters(self):
+        with patch.object(database, "count_emails", return_value=7) as mocked:
+            response = client.get("/api/emails/count?batch_id=batch_xyz")
+        self.assertEqual(response.json()["total"], 7)
+        mocked.assert_called_once_with(status=None, category=None, processing_status=None, batch_id="batch_xyz")
+
+    def test_route_declared_before_single_email_route(self):
+        # If /api/emails/count were declared after /api/emails/{email_id},
+        # FastAPI would match "count" as an email_id and call
+        # database.get_email("count") instead of database.count_emails().
+        with patch.object(database, "get_email", side_effect=AssertionError("must not hit the {email_id} route")), \
+             patch.object(database, "count_emails", return_value=0) as mocked_count:
+            response = client.get("/api/emails/count")
+        self.assertEqual(response.status_code, 200)
+        mocked_count.assert_called_once()
 
 
 class GetEmailEndpointTests(unittest.TestCase):

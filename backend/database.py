@@ -188,8 +188,14 @@ def list_emails(
     processing_status: str | None = None,
     batch_id: str | None = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> list[dict]:
-    """Minimal dashboard listing, optionally filtered by status/category/processing_status/batch_id."""
+    """Minimal dashboard listing, optionally filtered by status/category/processing_status/batch_id.
+
+    Sorted by created_at desc, then email_id asc as a deterministic
+    tie-breaker, so that paginating with limit/offset never skips or
+    duplicates rows that happen to share the same created_at value.
+    """
     client = get_supabase_client()
     query = client.table("emails").select("*")
     if status is not None:
@@ -200,8 +206,31 @@ def list_emails(
         query = query.eq("processing_status", processing_status)
     if batch_id is not None:
         query = query.eq("batch_id", batch_id)
-    response = query.order("created_at", desc=True).limit(limit).execute()
+    query = query.order("created_at", desc=True).order("email_id", desc=False)
+    response = query.range(offset, offset + limit - 1).execute()
     return response.data
+
+
+def count_emails(
+    *,
+    status: str | None = None,
+    category: str | None = None,
+    processing_status: str | None = None,
+    batch_id: str | None = None,
+) -> int:
+    """Total row count for the same filters list_emails() accepts, ignoring limit/offset."""
+    client = get_supabase_client()
+    query = client.table("emails").select("*", count="exact")
+    if status is not None:
+        query = query.eq("status", status)
+    if category is not None:
+        query = query.eq("category", category)
+    if processing_status is not None:
+        query = query.eq("processing_status", processing_status)
+    if batch_id is not None:
+        query = query.eq("batch_id", batch_id)
+    response = query.execute()
+    return response.count or 0
 
 
 def update_processing_state(
