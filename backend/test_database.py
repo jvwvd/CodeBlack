@@ -90,7 +90,10 @@ class UpsertEmailTests(unittest.TestCase):
 
 
 class UpsertEmailSourceTests(unittest.TestCase):
-    def test_writes_exactly_the_five_raw_fields(self):
+    def test_writes_exactly_the_five_raw_fields_plus_batch_columns(self):
+        # batch_id/original_email_id are additive columns for batch-upload
+        # processing (see schema.sql's batch migration note); every caller
+        # that does not pass them explicitly writes them as None.
         resp = MagicMock(data=[{"email_id": "email_004"}])
         client, table_mock = _fake_client_with_table_chain(resp)
         with patch.object(database, "get_supabase_client", return_value=client):
@@ -100,9 +103,34 @@ class UpsertEmailSourceTests(unittest.TestCase):
         sent_row = table_mock.upsert.call_args.args[0]
         self.assertEqual(
             sent_row,
-            {"email_id": "email_004", "sender": "a@b.com", "subject": "s", "body": "b", "source_attachments": ["x"]},
+            {
+                "email_id": "email_004",
+                "sender": "a@b.com",
+                "subject": "s",
+                "body": "b",
+                "source_attachments": ["x"],
+                "batch_id": None,
+                "original_email_id": None,
+            },
         )
         self.assertEqual(table_mock.upsert.call_args.kwargs["on_conflict"], "email_id")
+
+    def test_batch_id_and_original_email_id_are_written_when_supplied(self):
+        resp = MagicMock(data=[{"email_id": "batch_xyz__email_004"}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.upsert_email_source(
+                "batch_xyz__email_004",
+                sender="a@b.com",
+                subject="s",
+                body="b",
+                source_attachments=["x"],
+                batch_id="batch_xyz",
+                original_email_id="email_004",
+            )
+        sent_row = table_mock.upsert.call_args.args[0]
+        self.assertEqual(sent_row["batch_id"], "batch_xyz")
+        self.assertEqual(sent_row["original_email_id"], "email_004")
 
     def test_cannot_be_called_with_processing_or_result_fields(self):
         # The keyword-only signature has no parameter for these at all — passing
@@ -225,6 +253,56 @@ class ListEmailsTests(unittest.TestCase):
         with patch.object(database, "get_supabase_client", return_value=client):
             database.list_emails(limit=5)
         table_mock.limit.assert_called_once_with(5)
+
+    def test_batch_id_filter(self):
+        resp = MagicMock(data=[])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.list_emails(batch_id="batch_abc")
+        table_mock.eq.assert_called_once_with("batch_id", "batch_abc")
+
+
+class BatchHelperTests(unittest.TestCase):
+    def test_create_batch_writes_expected_row(self):
+        resp = MagicMock(data=[{"batch_id": "batch_1", "total": 3}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            result = database.create_batch("batch_1", total=3)
+        sent_row = table_mock.upsert.call_args.args[0]
+        self.assertEqual(sent_row["batch_id"], "batch_1")
+        self.assertEqual(sent_row["total"], 3)
+        self.assertEqual(sent_row["done"], 0)
+        self.assertEqual(sent_row["failed"], 0)
+        self.assertEqual(sent_row["status"], "processing")
+        self.assertIsNone(sent_row["finished_at"])
+        self.assertEqual(table_mock.upsert.call_args.kwargs["on_conflict"], "batch_id")
+        self.assertEqual(result, {"batch_id": "batch_1", "total": 3})
+
+    def test_get_batch_returns_row(self):
+        resp = MagicMock(data={"batch_id": "batch_1", "total": 3, "done": 1, "failed": 0})
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            result = database.get_batch("batch_1")
+        table_mock.eq.assert_called_once_with("batch_id", "batch_1")
+        self.assertEqual(result["done"], 1)
+
+    def test_update_batch_progress_writes_only_supplied_fields(self):
+        resp = MagicMock(data=[{"batch_id": "batch_1", "done": 2, "failed": 1}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.update_batch_progress("batch_1", done=2, failed=1)
+        updates = table_mock.update.call_args.args[0]
+        self.assertEqual(updates, {"done": 2, "failed": 1})
+
+    def test_update_batch_progress_finished_stamps_finished_at_and_status(self):
+        resp = MagicMock(data=[{"batch_id": "batch_1", "status": "completed"}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.update_batch_progress("batch_1", status="completed", finished=True)
+        updates = table_mock.update.call_args.args[0]
+        self.assertEqual(updates["status"], "completed")
+        self.assertIn("finished_at", updates)
+        self.assertIsNotNone(updates["finished_at"])
 
 
 class UpdateProcessingStateTests(unittest.TestCase):
