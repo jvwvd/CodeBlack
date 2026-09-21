@@ -4,7 +4,7 @@
   // See PROJECT_RULES.md §2 (deployment target) and §20 (lifecycle notes).
   "name": "sdoc-backend",
   "main": "src/index.js",
-  "compatibility_date": "2026-09-22",
+  "compatibility_date": "2026-09-21",
   "compatibility_flags": ["nodejs_compat"],
 
   // Non-secret config only. Every other value backend/config.py's
