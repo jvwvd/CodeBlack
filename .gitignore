@@ -28,3 +28,7 @@ ground_truth.json
 
 # Logs
 *.log
+*.zip
+
+# Evaluation tooling output
+evaluation/output/
