@@ -2,6 +2,7 @@ import base64
 import hashlib
 
 import httpx
+import pymupdf
 from pydantic import BaseModel
 
 from config import settings
@@ -251,42 +252,64 @@ def read_scanned_pdf_with_vision(
     data: bytes,
 ) -> str | None:
     """
-    Read an image-only/scanned PDF through OpenCode Go.
+    Vision fallback for image-only/scanned PDFs.
 
-    This function performs document reading only.
-    It must never decide OK/MISMATCH/NEEDS_REVIEW.
+    Native PDF parsing happens before this function.
+    This function only transcribes visible text.
+    It never decides OK/MISMATCH/NEEDS_REVIEW.
     """
 
-    prompt = """
-Read this scanned shipping document and transcribe the visible text.
+    if not _api_key():
+        return None
 
-Rules:
-- Do not invent or infer missing text.
-- Preserve labels, company names, ports, container quantities, and weights.
-- If text is unreadable, omit it rather than guessing.
-- Return plain extracted text only.
-"""
+    try:
+        document = pymupdf.open(
+            stream=data,
+            filetype="pdf",
+        )
 
-    encoded_pdf = base64.b64encode(
-        data
-    ).decode("utf-8")
-
-    content = [
-        {
-            "type": "file",
-            "file": {
-                "filename": "scanned_document.pdf",
-                "file_data": (
-                    "data:application/pdf;base64,"
-                    + encoded_pdf
+        content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    "Transcribe the visible text from this scanned shipping "
+                    "document. Preserve labels, company names, ports, "
+                    "container quantities and weights. "
+                    "Do not infer or invent unreadable text. "
+                    "Return plain extracted text only."
                 ),
-            },
-        },
-        {
-            "type": "text",
-            "text": prompt,
-        },
-    ]
+            }
+        ]
+
+        # Keep the request lightweight for hackathon documents.
+        for page in list(document)[:4]:
+            pixmap = page.get_pixmap(
+                matrix=pymupdf.Matrix(2, 2),
+                alpha=False,
+            )
+
+            png_bytes = pixmap.tobytes("png")
+            encoded = base64.b64encode(
+                png_bytes
+            ).decode("ascii")
+
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": (
+                            "data:image/png;base64,"
+                            + encoded
+                        ),
+                        "detail": "high",
+                    },
+                }
+            )
+
+        document.close()
+
+    except Exception:
+        return None
 
     text = _chat(
         content,
@@ -294,10 +317,10 @@ Rules:
             "vision",
             data,
         ),
-        max_tokens=4096,
+        max_tokens=4000,
     )
 
-    if text is None:
+    if not text:
         return None
 
     text = text.strip()
