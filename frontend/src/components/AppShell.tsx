@@ -15,31 +15,28 @@ import {
 import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 
-import { USE_MOCK } from "../api";
+import { API_BASE_URL } from "../api";
 import { Wordmark } from "./Logo";
 import { Button } from "./ui";
 import { useEmailCount, useHealth } from "./queries";
 
 /* ---------------------------------------------------------- Connection */
 
-type Connection = "mock" | "connected" | "unreachable" | "checking";
+type Connection = "connected" | "unreachable" | "checking";
 
 function useConnection(): Connection {
   const health = useHealth();
-  if (USE_MOCK) return "mock";
   if (health.isPending) return "checking";
   return health.isError ? "unreachable" : "connected";
 }
 
 const CONNECTION_TEXT: Record<Connection, string> = {
-  mock: "Demo data",
   connected: "Connected",
   unreachable: "Backend unreachable",
   checking: "Checking connection",
 };
 
 const CONNECTION_DOT: Record<Connection, string> = {
-  mock: "bg-warning",
   connected: "bg-success",
   unreachable: "bg-danger",
   checking: "bg-muted",
@@ -47,7 +44,7 @@ const CONNECTION_DOT: Record<Connection, string> = {
 
 function ConnectionIndicator({ connection }: { connection: Connection }) {
   return (
-    <p className="flex items-center gap-2 text-2xs text-on-ink-muted">
+    <p className="flex items-center gap-2 text-2xs text-on-ink-muted" title={API_BASE_URL}>
       <span aria-hidden className={`size-2 shrink-0 rounded-full ${CONNECTION_DOT[connection]}`} />
       {CONNECTION_TEXT[connection]}
     </p>
@@ -125,7 +122,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
   const health = useHealth();
-  const unreachable = !USE_MOCK && health.isError;
+  const unreachable = health.isError;
 
   // Route changes close the drawer so the content is visible after a tap.
   useEffect(() => {

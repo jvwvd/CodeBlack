@@ -110,8 +110,8 @@ export function ReviewQueue() {
           {emails.isSuccess && records.length === 0 ? (
             <EmptyState
               icon={UserCheck}
-              title="Nothing to review"
-              message="No email is currently waiting for a person. Cases appear here when the pipeline cannot decide on its own."
+              title="Nothing needs review."
+              message="No email is waiting for a person. Cases appear here when the backend cannot decide on its own."
             />
           ) : null}
 

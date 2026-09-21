@@ -11,7 +11,9 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "./index.css";
 
+import { IS_CONFIGURED } from "./api";
 import App from "./App";
+import { ConfigError } from "./components/ConfigError";
 import { ToastProvider } from "./components/Toast";
 
 const queryClient = new QueryClient({
@@ -28,12 +30,16 @@ if (!container) throw new Error("Root element #root is missing from index.html")
 
 createRoot(container).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <ToastProvider>
-          <App />
-        </ToastProvider>
-      </BrowserRouter>
-    </QueryClientProvider>
+    {IS_CONFIGURED ? (
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <ToastProvider>
+            <App />
+          </ToastProvider>
+        </BrowserRouter>
+      </QueryClientProvider>
+    ) : (
+      <ConfigError />
+    )}
   </StrictMode>,
 );

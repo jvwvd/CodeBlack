@@ -8,7 +8,7 @@
  */
 import { FIELD_KEYS, type FieldKey } from "../types";
 import { formatNumber } from "./format";
-import { DISCREPANCY_SAMPLE_LIMIT, FIELD_LABELS } from "./labels";
+import { DISCREPANCY_SCAN_LIMIT, FIELD_LABELS } from "./labels";
 import { useEmails } from "./queries";
 import { EmptyState, ErrorState, Panel, SkeletonBlock } from "./ui";
 
@@ -18,7 +18,7 @@ interface Row {
 }
 
 export function DiscrepancyChart() {
-  const emails = useEmails({ status: "MISMATCH", limit: DISCREPANCY_SAMPLE_LIMIT });
+  const emails = useEmails({ status: "MISMATCH", limit: DISCREPANCY_SCAN_LIMIT });
 
   const records = emails.data?.items ?? [];
 

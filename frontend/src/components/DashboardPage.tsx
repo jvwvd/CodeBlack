@@ -20,7 +20,7 @@ import {
   isBatchEmail,
 } from "./labels";
 import { useEmailCounts, useEmails } from "./queries";
-import { EmptyState, ErrorState, MonoId, Panel, SkeletonBlock, StatusBadge, Tag } from "./ui";
+import { Button, EmptyState, ErrorState, MonoId, Panel, SkeletonBlock, StatusBadge, Tag } from "./ui";
 
 interface Figure {
   label: string;
@@ -207,13 +207,12 @@ export function DashboardPage() {
           <Panel>
             <EmptyState
               title="No emails yet"
-              message="Emails appear here once the organizer inbox has been imported into the backend, or as soon as you upload a dataset yourself."
+              message="Upload a dataset or a single email to start. Everything you add is checked automatically and appears here."
               action={
                 <Link to="/upload">
-                  <span className="inline-flex items-center gap-2 rounded-control border border-accent bg-accent px-3 py-1.5 text-sm font-medium text-white">
-                    <Upload aria-hidden className="size-4" />
+                  <Button variant="primary" icon={Upload}>
                     Upload
-                  </span>
+                  </Button>
                 </Link>
               }
             />

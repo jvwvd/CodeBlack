@@ -9,7 +9,7 @@
  * Nothing here recomputes a verdict; sorting, filtering and search are
  * presentation only.
  */
-import { Search, SlidersHorizontal, X } from "lucide-react";
+import { Search, SlidersHorizontal, Upload, X } from "lucide-react";
 import { useEffect, useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
@@ -342,14 +342,20 @@ export function EmailList() {
                   ? "No email on this page matches your search. Search only covers the page you are on — try the next page, or a server-side filter."
                   : hasFilters
                     ? "Try a different filter, or clear them to see every email."
-                    : "Emails appear here once the backend has imported them."
+                    : "Upload a dataset or a single email to start. Everything you add appears here once it has been checked."
               }
               action={
                 hasFilters ? (
                   <Button variant="secondary" onClick={() => setParams({}, { replace: true })}>
                     Clear filters
                   </Button>
-                ) : null
+                ) : (
+                  <Link to="/upload">
+                    <Button variant="primary" icon={Upload}>
+                      Upload
+                    </Button>
+                  </Link>
+                )
               }
             />
           ) : null}

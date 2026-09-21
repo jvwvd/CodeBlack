@@ -206,8 +206,8 @@ export function displayEmailId(record: EmailRecord): string {
   return record.original_email_id || record.email_id;
 }
 
-/** Emails sampled for the discrepancy chart (GET /api/emails?status=MISMATCH). */
-export const DISCREPANCY_SAMPLE_LIMIT = 500;
+/** Emails scanned for the discrepancy chart (GET /api/emails?status=MISMATCH). */
+export const DISCREPANCY_SCAN_LIMIT = 500;
 
 /**
  * Signed URLs expire after 300 s server-side
