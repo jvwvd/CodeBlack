@@ -9,6 +9,7 @@ import { Link } from "react-router-dom";
 
 import type { Category, EmailFilters, EmailRecord } from "../types";
 import { PageHeader } from "./AppShell";
+import { DiscrepancyChart } from "./DiscrepancyChart";
 import { formatNumber, formatRelative, setDocumentTitle } from "./format";
 import {
   ATTENTION_LIMIT,
@@ -219,7 +220,8 @@ export function DashboardPage() {
           </Panel>
         </div>
       ) : (
-        <div className="mt-6 grid gap-6 lg:grid-cols-2">
+        <div className="mt-6 flex flex-col gap-6">
+        <div className="grid gap-6 lg:grid-cols-2">
           <Panel
             title="Category breakdown"
             description={`${formatNumber(classified)} of ${formatNumber(totalEmails)} emails classified`}
@@ -276,6 +278,9 @@ export function DashboardPage() {
               </ul>
             )}
           </Panel>
+          </div>
+
+          <DiscrepancyChart />
         </div>
       )}
     </>

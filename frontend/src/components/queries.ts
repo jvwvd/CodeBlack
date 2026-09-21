@@ -15,6 +15,7 @@ import {
 } from "@tanstack/react-query";
 
 import * as api from "../api";
+import { BATCH_COUNTS_POLL_MS, BATCH_POLL_MS } from "./labels";
 import type {
   AttachmentRecord,
   Batch,
@@ -112,7 +113,27 @@ export function useBatch(batchId: string): UseQueryResult<Batch, api.ApiError> {
     queryFn: () => api.getBatch(batchId),
     enabled: Boolean(batchId),
     retry: (failureCount, error) => (error.status === 404 ? false : failureCount < 2),
-    refetchInterval: (query) => (query.state.data?.status === "processing" ? 3_000 : false),
+    refetchInterval: (query) => (query.state.data?.status === "processing" ? BATCH_POLL_MS : false),
+  });
+}
+
+/**
+ * Per-batch counters. GET /api/emails/count runs a full filtered scan
+ * server-side, so these refresh far less often than the 3 s progress poll —
+ * and stop entirely once the batch is no longer processing.
+ */
+export function useBatchCounts(batchId: string, filterSets: EmailFilters[], live: boolean) {
+  return useQueries({
+    queries: filterSets.map((filters) => {
+      const withBatch = { ...filters, batch_id: batchId };
+      return {
+        queryKey: queryKeys.emailCount(withBatch),
+        queryFn: () => api.countEmails(withBatch),
+        enabled: Boolean(batchId),
+        refetchInterval: live ? BATCH_COUNTS_POLL_MS : (false as const),
+        staleTime: live ? 0 : 60_000,
+      };
+    }),
   });
 }
 

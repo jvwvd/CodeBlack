@@ -205,3 +205,21 @@ export function isBatchEmail(record: EmailRecord): boolean {
 export function displayEmailId(record: EmailRecord): string {
   return record.original_email_id || record.email_id;
 }
+
+/** Emails sampled for the discrepancy chart (GET /api/emails?status=MISMATCH). */
+export const DISCREPANCY_SAMPLE_LIMIT = 500;
+
+/**
+ * Signed URLs expire after 300 s server-side
+ * (database.DEFAULT_SIGNED_URL_EXPIRY_SECONDS). Never reuse one older than
+ * four minutes — mint a fresh one instead.
+ */
+export const SIGNED_URL_MAX_AGE_MS = 4 * 60 * 1000;
+
+/** Batch progress polls every 3 s; the expensive count endpoint every 10 s. */
+export const BATCH_POLL_MS = 3_000;
+export const BATCH_COUNTS_POLL_MS = 10_000;
+
+/** Live batch speed/ETA are hidden until the run is long enough to be honest. */
+export const ETA_MIN_DONE = 5;
+export const ETA_MIN_ELAPSED_MS = 30_000;

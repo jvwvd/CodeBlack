@@ -16,37 +16,9 @@ import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 
 import { USE_MOCK } from "../api";
+import { Wordmark } from "./Logo";
 import { Button } from "./ui";
 import { useEmailCount, useHealth } from "./queries";
-
-/* -------------------------------------------------------------- Wordmark */
-
-function Wordmark() {
-  return (
-    <div className="flex items-start gap-2.5">
-      {/* Cargo-block mark: a solid square with a square gap punched out. */}
-      <svg viewBox="0 0 20 20" aria-hidden className="mt-0.5 size-5 shrink-0">
-        <path
-          d="M0 0h20v20H0z M9 9h2v2H9z"
-          fill="currentColor"
-          fillRule="evenodd"
-          className="text-on-ink"
-        />
-      </svg>
-      <div className="min-w-0">
-        <p className="text-md leading-none text-on-ink">
-          <span className="font-normal">Code</span>
-          <span className="font-bold">Black</span>
-        </p>
-        <p className="mt-1.5 text-2xs leading-tight text-on-ink-muted">
-          SDOC
-          <br />
-          Shipping document verification
-        </p>
-      </div>
-    </div>
-  );
-}
 
 /* ---------------------------------------------------------- Connection */
 

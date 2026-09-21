@@ -12,6 +12,7 @@ import type { EmailRecord } from "../types";
 import { PageHeader } from "./AppShell";
 import { AttachmentList } from "./AttachmentList";
 import { ComparisonView } from "./ComparisonView";
+import { DocumentPreview } from "./DocumentPreview";
 import { formatAbsolute, setDocumentTitle } from "./format";
 import {
   CATEGORY_EXPLANATION,
@@ -23,6 +24,7 @@ import {
 } from "./labels";
 import { useAttachments, useEmail, useProcessEmail, useRetryEmail } from "./queries";
 import { ReviewPanel } from "./ReviewPanel";
+import { Timeline } from "./Timeline";
 import { useToast } from "./Toast";
 import {
   Banner,
@@ -269,7 +271,7 @@ export function EmailDetailPage() {
         description={record.sender || "Unknown sender"}
       />
 
-      <div className="mb-6 flex flex-wrap items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         <MonoId>{displayEmailId(record)}</MonoId>
         {isBatchEmail(record) && record.batch_id ? (
           <Link to={`/batches/${encodeURIComponent(record.batch_id)}`} className="hover:underline">
@@ -285,10 +287,26 @@ export function EmailDetailPage() {
         ) : null}
       </div>
 
+      <div className="mb-6 rounded-panel border border-line bg-surface px-4 py-3.5 sm:px-5">
+        <Timeline record={record} />
+      </div>
+
       <div className="flex flex-col gap-6">
         <ResultBanner record={record} onOpenReview={() => setReviewOpen(true)} />
 
-        {showComparison ? <ComparisonView record={record} /> : null}
+        {showComparison ? (
+          // The comparison table stays dominant: it takes the wider column and
+          // the preview sits beside it only when there is room (>=1280px).
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)] xl:items-start">
+            <ComparisonView record={record} />
+            <DocumentPreview
+              attachments={attachments.data?.items ?? []}
+              isPending={attachments.isPending}
+              error={attachments.isError ? attachments.error.message : null}
+              onRetry={() => void attachments.refetch()}
+            />
+          </div>
+        ) : null}
 
         {showCategoryExplanation && !showComparison ? (
           <Panel title="No documents to compare">
@@ -327,12 +345,21 @@ export function EmailDetailPage() {
           </Panel>
         ) : null}
 
-        <AttachmentList
-          attachments={attachments.data?.items ?? []}
-          isPending={attachments.isPending}
-          error={attachments.isError ? attachments.error.message : null}
-          onRetry={() => void attachments.refetch()}
-        />
+        {showComparison ? (
+          <AttachmentList
+            attachments={attachments.data?.items ?? []}
+            isPending={attachments.isPending}
+            error={attachments.isError ? attachments.error.message : null}
+            onRetry={() => void attachments.refetch()}
+          />
+        ) : (
+          <DocumentPreview
+            attachments={attachments.data?.items ?? []}
+            isPending={attachments.isPending}
+            error={attachments.isError ? attachments.error.message : null}
+            onRetry={() => void attachments.refetch()}
+          />
+        )}
 
         <EmailBody body={record.body} />
       </div>

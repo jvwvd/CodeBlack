@@ -6,17 +6,112 @@
  * shown are the backend's own done/failed/total — nothing is derived here.
  */
 import { AlertOctagon, CheckCircle2, Inbox, Loader2, PackageSearch } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
-import type { Batch } from "../types";
+import type { Batch, EmailFilters } from "../types";
 import { PageHeader } from "./AppShell";
 import { ExportMenu } from "./ExportMenu";
 import { formatAbsolute, formatNumber, formatRelative, setDocumentTitle } from "./format";
-import { useBatch } from "./queries";
+import { ETA_MIN_DONE, ETA_MIN_ELAPSED_MS } from "./labels";
+import { useBatch, useBatchCounts } from "./queries";
 import { Banner, Button, EmptyState, ErrorState, MonoId, Panel, SkeletonBlock } from "./ui";
+import { Link as RouterLink } from "react-router-dom";
 
-function ProgressBar({ batch }: { batch: Batch }) {
+
+/* ------------------------------------------------------- Speed and ETA */
+
+interface Rate {
+  /** Emails per minute, or null while there is not enough evidence. */
+  perMinute: number | null;
+  /** Milliseconds remaining, or null. */
+  remainingMs: number | null;
+}
+
+/**
+ * Derives throughput from the backend's own done/total/created_at. Returns
+ * nulls (rendered as "Estimating…") until at least ETA_MIN_DONE emails are
+ * done AND ETA_MIN_ELAPSED_MS has passed, and whenever the arithmetic would
+ * be nonsense — a created_at in the future, clock skew, or an absurd ETA.
+ */
+function computeRate(batch: Batch, now: number): Rate {
+  const none: Rate = { perMinute: null, remainingMs: null };
+  if (!batch.created_at) return none;
+
+  const started = new Date(batch.created_at).getTime();
+  if (!Number.isFinite(started)) return none;
+
+  const elapsedMs = now - started;
+  const handled = batch.done + batch.failed;
+
+  if (elapsedMs < ETA_MIN_ELAPSED_MS || handled < ETA_MIN_DONE) return none;
+  if (elapsedMs <= 0) return none;
+
+  const perMinute = (handled / elapsedMs) * 60_000;
+  if (!Number.isFinite(perMinute) || perMinute <= 0) return none;
+
+  const remaining = batch.total - handled;
+  if (remaining <= 0) return { perMinute, remainingMs: 0 };
+
+  const remainingMs = (remaining / handled) * elapsedMs;
+  // Anything over 24 h is clock skew or a stalled batch, not a useful estimate.
+  if (!Number.isFinite(remainingMs) || remainingMs < 0 || remainingMs > 86_400_000) {
+    return { perMinute, remainingMs: null };
+  }
+  return { perMinute, remainingMs };
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours} h ${minutes} min`;
+  if (minutes > 0) return `${minutes} min ${seconds} s`;
+  return `${seconds} s`;
+}
+
+/** Counters shown for one batch, each linking to the inbox pre-filtered. */
+const BATCH_COUNTERS: Array<{ label: string; filters: EmailFilters; query: string }> = [
+  { label: "Document checks", filters: { category: "BL_COMPARISON" }, query: "category=BL_COMPARISON" },
+  { label: "Mismatches", filters: { status: "MISMATCH" }, query: "status=MISMATCH" },
+  { label: "Needs review", filters: { status: "NEEDS_REVIEW" }, query: "status=NEEDS_REVIEW" },
+  { label: "No mismatch", filters: { status: "OK" }, query: "status=OK" },
+];
+
+function BatchCounters({ batchId, live }: { batchId: string; live: boolean }) {
+  const counts = useBatchCounts(
+    batchId,
+    BATCH_COUNTERS.map((counter) => counter.filters),
+    live,
+  );
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {BATCH_COUNTERS.map((counter, index) => {
+        const query = counts[index];
+        return (
+          <RouterLink
+            key={counter.label}
+            to={`/inbox?batch_id=${encodeURIComponent(batchId)}&${counter.query}`}
+            className="rounded-control border border-line px-3 py-2.5 transition-colors hover:border-line-strong hover:bg-canvas"
+          >
+            {query?.isPending ? (
+              <SkeletonBlock className="h-6 w-10" />
+            ) : query?.isError ? (
+              <p className="text-md font-semibold text-danger">—</p>
+            ) : (
+              <p className="text-lg font-semibold tabular">{formatNumber(query?.data ?? 0)}</p>
+            )}
+            <p className="mt-0.5 text-2xs text-muted">{counter.label}</p>
+          </RouterLink>
+        );
+      })}
+    </div>
+  );
+}
+
+function ProgressBar({ batch, rate, runTimeMs }: { batch: Batch; rate: Rate; runTimeMs: number | null }) {
   const handled = batch.done + batch.failed;
   const percent = batch.total === 0 ? 0 : Math.min(100, Math.round((handled / batch.total) * 100));
 
@@ -73,6 +168,39 @@ function ProgressBar({ batch }: { batch: Batch }) {
           </dd>
         </div>
       </dl>
+
+      {batch.status === "processing" ? (
+        <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-t border-line pt-4 sm:grid-cols-4">
+          <div>
+            <dt className="text-2xs text-muted">Speed</dt>
+            <dd className="text-sm tabular">
+              {rate.perMinute === null ? (
+                <span className="text-muted">Estimating…</span>
+              ) : (
+                `${rate.perMinute.toFixed(1)} emails/min`
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-2xs text-muted">Time remaining</dt>
+            <dd className="text-sm tabular">
+              {rate.remainingMs === null ? (
+                <span className="text-muted">Estimating…</span>
+              ) : (
+                <>
+                  about {formatDuration(rate.remainingMs)}{" "}
+                  <span className="text-2xs text-muted">(estimate)</span>
+                </>
+              )}
+            </dd>
+          </div>
+        </dl>
+      ) : runTimeMs !== null ? (
+        <dl className="mt-4 border-t border-line pt-4">
+          <dt className="text-2xs text-muted">Total run time</dt>
+          <dd className="text-sm tabular">{formatDuration(runTimeMs)}</dd>
+        </dl>
+      ) : null}
     </div>
   );
 }
@@ -80,10 +208,19 @@ function ProgressBar({ batch }: { batch: Batch }) {
 export function BatchPage() {
   const { batchId = "" } = useParams();
   const batch = useBatch(batchId);
+  const processing = batch.data?.status === "processing";
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     setDocumentTitle("Batch progress");
   }, []);
+
+  // Keeps speed/ETA moving between polls. Stops the moment the batch does.
+  useEffect(() => {
+    if (!processing) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, [processing]);
 
   if (batch.isPending) {
     return (
@@ -135,7 +272,11 @@ export function BatchPage() {
   }
 
   const data = batch.data;
-  const processing = data.status === "processing";
+  const rate = computeRate(data, now);
+  const runTimeMs =
+    data.created_at && data.finished_at
+      ? Math.max(0, new Date(data.finished_at).getTime() - new Date(data.created_at).getTime())
+      : null;
   const inboxHref = `/inbox?batch_id=${encodeURIComponent(data.batch_id)}`;
 
   return (
@@ -195,7 +336,18 @@ export function BatchPage() {
         )}
 
         <Panel title="Progress">
-          <ProgressBar batch={data} />
+          <ProgressBar batch={data} rate={rate} runTimeMs={runTimeMs} />
+        </Panel>
+
+        <Panel
+          title="Results so far"
+          description={
+            processing
+              ? "Counted by the backend, refreshed every 10 seconds."
+              : "Final counts for this batch."
+          }
+        >
+          <BatchCounters batchId={data.batch_id} live={processing} />
         </Panel>
 
         <Panel title="What happens next">

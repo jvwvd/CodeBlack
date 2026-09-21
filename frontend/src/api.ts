@@ -435,6 +435,35 @@ export async function getSignedUrl(path: string): Promise<SignedUrlResponse> {
   return getJson<SignedUrlResponse>("/api/documents/signed-url", { path });
 }
 
+/**
+ * Fetches a private document's text through a fresh signed URL.
+ *
+ * Used only for .txt previews. The response is returned as a plain string and
+ * is rendered as text, never as HTML. The signed URL is minted per call, so
+ * nothing cached or expired is reused.
+ */
+export async function fetchDocumentText(path: string): Promise<string> {
+  const { url: signed } = await getSignedUrl(path);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  try {
+    const response = await fetch(signed, { signal: controller.signal });
+    if (!response.ok) {
+      throw new ApiError(response.status, `The file could not be read (status ${response.status}).`);
+    }
+    return await response.text();
+  } catch (cause) {
+    if (cause instanceof ApiError) throw cause;
+    if (cause instanceof DOMException && cause.name === "AbortError") {
+      throw new ApiError(0, "Reading the file timed out.");
+    }
+    throw new ApiError(0, "The file could not be read from storage in this browser.");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function processEmail(emailId: string): Promise<EmailResult> {
   if (USE_MOCK) {
     const record = findMock(emailId);

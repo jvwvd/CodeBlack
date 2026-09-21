@@ -33,7 +33,7 @@ function Cell({
 
   return (
     <td
-      className={`px-4 py-3 align-top text-sm break-words whitespace-pre-line ${
+      className={`px-3 py-3 align-top text-sm break-words whitespace-pre-line ${
         missing ? "text-muted italic" : strong ? "font-semibold text-text" : "text-text"
       }`}
     >
@@ -59,13 +59,13 @@ export function ComparisonView({ record }: { record: EmailRecord }) {
 
       {/* Scrolls inside its own container so the page never moves sideways. */}
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[46rem] border-collapse text-left">
+        <table className="w-full min-w-[39rem] border-collapse text-left">
           <thead>
             <tr className="bg-canvas text-xs text-muted">
-              <th scope="col" className="w-44 px-4 py-2.5 font-medium">Field</th>
+              <th scope="col" className="w-36 px-3 py-2.5 font-medium">Field</th>
               <th scope="col" className="px-4 py-2.5 font-medium">SI (reference)</th>
               <th scope="col" className="px-4 py-2.5 font-medium">BL (draft)</th>
-              <th scope="col" className="w-32 px-4 py-2.5 font-medium">Check</th>
+              <th scope="col" className="w-24 px-3 py-2.5 font-medium">Check</th>
             </tr>
           </thead>
           <tbody>
@@ -80,7 +80,7 @@ export function ComparisonView({ record }: { record: EmailRecord }) {
                 >
                   <th
                     scope="row"
-                    className={`px-4 py-3 align-top text-sm font-medium ${
+                    className={`px-3 py-3 align-top text-sm font-medium ${
                       differs ? "text-danger" : "text-muted"
                     }`}
                   >
@@ -88,7 +88,7 @@ export function ComparisonView({ record }: { record: EmailRecord }) {
                   </th>
                   <Cell side={record.si} fieldKey={key} strong={differs} />
                   <Cell side={record.bl} fieldKey={key} strong={differs} />
-                  <td className="px-4 py-3 align-top">
+                  <td className="px-3 py-3 align-top">
                     {!showCheckColumn ? null : differs ? (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-danger-line bg-surface px-2 py-0.5 text-2xs font-semibold text-danger whitespace-nowrap">
                         <AlertTriangle aria-hidden className="size-3.5" />
