@@ -281,6 +281,93 @@ class ProcessAndPersistEmailTests(unittest.TestCase):
         self.assertIs(result, fake_result)
 
 
+class RetryAndPersistEmailTests(unittest.TestCase):
+    def test_missing_email_returns_none_and_never_increments_or_processes(self):
+        with patch.object(database, "get_email", return_value=None), \
+             patch.object(database, "increment_retry_count") as mocked_increment, \
+             patch.object(orchestration, "process_and_persist_email") as mocked_process:
+            result = orchestration.retry_and_persist_email("email_missing")
+
+        self.assertIsNone(result)
+        mocked_increment.assert_not_called()
+        mocked_process.assert_not_called()
+
+    def test_successful_retry_increments_once_and_returns_result(self):
+        fake_result = EmailResult(email_id="email_004", category="BL_COMPARISON", status="OK")
+        row = {"email_id": "email_004", "retry_count": 1}
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "increment_retry_count", return_value={"retry_count": 2}) as mocked_increment, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result) as mocked_process:
+            result = orchestration.retry_and_persist_email("email_004")
+
+        self.assertIs(result, fake_result)
+        mocked_increment.assert_called_once_with("email_004")
+        mocked_process.assert_called_once_with("email_004")
+
+    def test_retry_count_incremented_exactly_once(self):
+        row = {"email_id": "email_004", "retry_count": 0}
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "increment_retry_count", return_value={}) as mocked_increment, \
+             patch.object(orchestration, "process_and_persist_email", return_value=None):
+            orchestration.retry_and_persist_email("email_004")
+
+        self.assertEqual(mocked_increment.call_count, 1)
+
+    def test_retry_reuses_process_and_persist_email_not_duplicated_logic(self):
+        # Confirms the retry path calls the existing orchestration flow
+        # rather than re-implementing process_stored_email/upsert_email itself.
+        row = {"email_id": "email_004", "retry_count": 0}
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "increment_retry_count", return_value={}), \
+             patch.object(orchestration, "process_stored_email") as mocked_process_stored, \
+             patch.object(database, "upsert_email") as mocked_upsert, \
+             patch.object(database, "update_processing_state") as mocked_state:
+            orchestration.retry_and_persist_email("email_004")
+
+        # process_and_persist_email itself is not mocked here, so this proves
+        # retry_and_persist_email() genuinely calls into it end-to-end.
+        mocked_state.assert_any_call("email_004", "processing", last_error=None)
+        mocked_process_stored.assert_called_once_with("email_004")
+
+    def test_failed_retry_preserves_incremented_retry_count_and_failed_state(self):
+        row = {"email_id": "email_004", "retry_count": 0}
+        call_order = []
+
+        def fake_increment(email_id):
+            call_order.append("increment_retry_count")
+            return {"retry_count": 1}
+
+        def fake_process_and_persist(email_id):
+            call_order.append("process_and_persist_email")
+            raise RuntimeError("boom with api_key=SUPER_SECRET_VALUE")
+
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "increment_retry_count", side_effect=fake_increment) as mocked_increment, \
+             patch.object(orchestration, "process_and_persist_email", side_effect=fake_process_and_persist):
+            with self.assertRaises(RuntimeError):
+                orchestration.retry_and_persist_email("email_004")
+
+        self.assertEqual(call_order, ["increment_retry_count", "process_and_persist_email"])
+        mocked_increment.assert_called_once_with("email_004")
+
+    def test_failed_retry_end_to_end_marks_failed_without_leaking_secret(self):
+        row = {"email_id": "email_004", "retry_count": 0}
+        leaky = RuntimeError("connection failed, api_key=SUPER_SECRET_VALUE")
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "increment_retry_count", return_value={"retry_count": 1}) as mocked_increment, \
+             patch.object(orchestration, "process_stored_email", side_effect=leaky), \
+             patch.object(database, "update_processing_state") as mocked_state, \
+             patch.object(database, "upsert_email") as mocked_upsert:
+            with self.assertRaises(RuntimeError):
+                orchestration.retry_and_persist_email("email_004")
+
+        mocked_increment.assert_called_once_with("email_004")
+        mocked_upsert.assert_not_called()
+        failed_call = mocked_state.call_args_list[-1]
+        self.assertEqual(failed_call.args, ("email_004", "failed"))
+        self.assertNotIn("SUPER_SECRET_VALUE", failed_call.kwargs["last_error"])
+
+
 class ApplyReviewCorrectionTests(unittest.TestCase):
     def _row(self, **overrides):
         base = {

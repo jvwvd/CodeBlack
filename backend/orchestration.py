@@ -119,6 +119,28 @@ def process_and_persist_email(email_id: str) -> EmailResult | None:
     return result
 
 
+def retry_and_persist_email(email_id: str) -> EmailResult | None:
+    """Manually re-run processing for one email from the dashboard.
+
+    Bumps retry_count exactly once for this attempt via
+    database.increment_retry_count(), then reuses
+    process_and_persist_email() unchanged for the actual processing/
+    persistence and processing_status/last_error handling — this function
+    implements no classification/extraction/comparison logic of its own
+    and adds no automatic/background retries of any kind.
+
+    Returns None (without incrementing retry_count) if the email does not
+    exist. On failure, process_and_persist_email() marks
+    processing_status='failed' with a safe error summary and re-raises;
+    the retry_count bumped here was already written and is preserved.
+    """
+    if database.get_email(email_id) is None:
+        return None
+
+    database.increment_retry_count(email_id)
+    return process_and_persist_email(email_id)
+
+
 def apply_review_correction(
     email_id: str,
     *,

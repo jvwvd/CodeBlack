@@ -195,6 +195,51 @@ class ProcessEmailEndpointTests(unittest.TestCase):
         self.assertNotIn("RuntimeError", response.text)
 
 
+class RetryEmailEndpointTests(unittest.TestCase):
+    def test_successful_retry_returns_200_with_canonical_result_body(self):
+        fake_result = EmailResult(
+            email_id="email_004", category="BL_COMPARISON", status="OK",
+            notes="No mismatch detected.",
+        )
+        with patch.object(
+            orchestration, "retry_and_persist_email", return_value=fake_result
+        ) as mocked:
+            response = client.post("/api/emails/email_004/retry")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), fake_result.model_dump(mode="json"))
+        mocked.assert_called_once_with("email_004")
+
+    def test_missing_email_returns_404(self):
+        with patch.object(orchestration, "retry_and_persist_email", return_value=None):
+            response = client.post("/api/emails/email_missing/retry")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("email_missing", response.json()["detail"])
+
+    def test_retry_calls_orchestration_not_database_directly(self):
+        # Endpoint must delegate to orchestration.retry_and_persist_email()
+        # rather than reimplementing retry_count/processing logic in main.py.
+        fake_result = EmailResult(email_id="email_004", category="GENERAL")
+        with patch.object(
+            orchestration, "retry_and_persist_email", return_value=fake_result
+        ) as mocked_orchestration, \
+             patch.object(database, "increment_retry_count") as mocked_increment:
+            response = client.post("/api/emails/email_004/retry")
+        self.assertEqual(response.status_code, 200)
+        mocked_orchestration.assert_called_once_with("email_004")
+        mocked_increment.assert_not_called()
+
+    def test_failed_retry_returns_generic_500_without_leaking_details(self):
+        with patch.object(
+            orchestration, "retry_and_persist_email",
+            side_effect=RuntimeError("internal failure with api_key=SUPER_SECRET_VALUE"),
+        ):
+            response = client.post("/api/emails/email_004/retry")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"detail": "internal server error"})
+        self.assertNotIn("SUPER_SECRET_VALUE", response.text)
+        self.assertNotIn("RuntimeError", response.text)
+
+
 class ReviewEmailEndpointTests(unittest.TestCase):
     def test_successful_correction_returns_200_with_updated_row(self):
         fake_row = {

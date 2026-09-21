@@ -252,6 +252,47 @@ class UpdateProcessingStateTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class IncrementRetryCountTests(unittest.TestCase):
+    def test_increments_existing_count_by_one(self):
+        row = {"email_id": "email_001", "retry_count": 2}
+        resp = MagicMock(data=[{"email_id": "email_001", "retry_count": 3}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "get_supabase_client", return_value=client):
+            result = database.increment_retry_count("email_001")
+        sent = table_mock.update.call_args.args[0]
+        self.assertEqual(sent, {"retry_count": 3})
+        table_mock.eq.assert_called_once_with("email_id", "email_001")
+        self.assertEqual(result, {"email_id": "email_001", "retry_count": 3})
+
+    def test_missing_retry_count_treated_as_zero(self):
+        row = {"email_id": "email_002"}
+        resp = MagicMock(data=[{"email_id": "email_002", "retry_count": 1}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "get_supabase_client", return_value=client):
+            database.increment_retry_count("email_002")
+        sent = table_mock.update.call_args.args[0]
+        self.assertEqual(sent, {"retry_count": 1})
+
+    def test_only_touches_retry_count(self):
+        row = {"email_id": "email_003", "retry_count": 0}
+        resp = MagicMock(data=[{"email_id": "email_003", "retry_count": 1}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "get_supabase_client", return_value=client):
+            database.increment_retry_count("email_003")
+        sent = table_mock.update.call_args.args[0]
+        self.assertEqual(set(sent), {"retry_count"})
+
+    def test_missing_email_returns_none_and_never_writes(self):
+        with patch.object(database, "get_email", return_value=None), \
+             patch.object(database, "get_supabase_client") as mocked_client:
+            result = database.increment_retry_count("email_missing")
+        self.assertIsNone(result)
+        mocked_client.assert_not_called()
+
+
 class CreateAttachmentRecordTests(unittest.TestCase):
     def test_expected_metadata_mapping_with_doc_type_none(self):
         resp = MagicMock(data=[{"id": "uuid-1"}])

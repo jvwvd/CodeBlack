@@ -213,6 +213,29 @@ def update_processing_state(
     return response.data[0] if response.data else None
 
 
+def increment_retry_count(email_id: str) -> dict | None:
+    """Bump retry_count by exactly 1 for one manual retry attempt.
+
+    Reads the current retry_count and writes back current + 1 (missing/
+    None treated as 0). Touches only retry_count — never processing_status
+    or last_error, which process_and_persist_email() manages itself right
+    after this is called. Returns None if the email does not exist.
+    """
+    row = get_email(email_id)
+    if row is None:
+        return None
+
+    next_count = (row.get("retry_count") or 0) + 1
+    client = get_supabase_client()
+    response = (
+        client.table("emails")
+        .update({"retry_count": next_count})
+        .eq("email_id", email_id)
+        .execute()
+    )
+    return response.data[0] if response.data else {**row, "retry_count": next_count}
+
+
 def create_attachment_record(
     email_id: str,
     storage_path: str,
