@@ -800,6 +800,162 @@ class ExtractFieldsLabelCoverageTests(unittest.TestCase):
         self.assertTrue(all(v is not None for v in result.model_dump().values()))
 
 
+PDF_BLOCK_LAYOUT_BL_TEXT = """
+BILL OF LADING (DRAFT)
+
+Shipper
+TEST EXPORTER LTD
+Consignee (Non-Negotiable) TEST IMPORTER SDN BHD
+Notify Party/Intermediate Consignee
+TEST IMPORTER SDN BHD
+Port of Loading (POL)
+SINGAPORE (SGSIN)
+Port of Discharge
+KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+TOTAL Gross Wt (kgs): 22,000 KG
+"""
+
+PDF_BLOCK_LAYOUT_BL_TEXT_DIFFERENT_CONSIGNEE = """
+BILL OF LADING (DRAFT)
+
+Shipper
+TEST EXPORTER LTD
+Consignee (Non-Negotiable) DIFFERENT IMPORTER SDN BHD
+Notify Party/Intermediate Consignee
+TEST IMPORTER SDN BHD
+Port of Loading (POL)
+SINGAPORE (SGSIN)
+Port of Discharge
+KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+TOTAL Gross Wt (kgs): 22,000 KG
+"""
+
+
+class PdfBlockLayoutLabelCoverageTests(unittest.TestCase):
+    """Regression coverage for Tier 3 of the residual-error analysis:
+    PDF block layouts (render.py's write_pdf()/block()) put the label
+    alone on its own line -- or, for longer labels, on the same line as
+    the value with no colon/pipe at all -- causing these fields to miss
+    every existing pattern and fall to the LLM fallback, which sometimes
+    absorbed the trailing address block into the value. All snippets here
+    are the exact layouts confirmed via direct extraction of the real
+    diagnosed PDF documents (email_107/160/273/351/434/499)."""
+
+    def test_notify_party_intermediate_consignee_line_break_form(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Notify Party/Intermediate Consignee\nKTP CO., LTD\n")
+        self.assertEqual(result.notify_party, "KTP CO., LTD")
+
+    def test_bare_notify_line_break_form(self):
+        # A companion gap found while verifying the diagnosed documents:
+        # bare "Notify" (no "Party") had no line-break form at all, only
+        # an inline-with-colon one -- needed for email_273/160/434(SI).
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Notify\nINTERNATIONAL FOREST PRODUCTS LLC\n")
+        self.assertEqual(result.notify_party, "INTERNATIONAL FOREST PRODUCTS LLC")
+
+    def test_notify_party_plain_line_break_form_still_supported(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Notify Party\nTOPKOPY MIDDLE EAST FZE\n")
+        self.assertEqual(result.notify_party, "TOPKOPY MIDDLE EAST FZE")
+
+    def test_consignee_non_negotiable_same_line_no_colon(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields(
+                "Consignee (Non-Negotiable) KPP-ANTALIS (SINGAPORE) PTE. LTD.\n"
+            )
+        self.assertEqual(result.consignee, "KPP-ANTALIS (SINGAPORE) PTE. LTD.")
+
+    def test_consignee_non_negotiable_does_not_absorb_trailing_address(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields(
+                "Consignee (Non-Negotiable) TOPKOPY MIDDLE EAST FZE\n"
+                "P.O. BOX 17436\n"
+                "JEBEL ALI FREE ZONE, DUBAI, UAE\n"
+            )
+        self.assertEqual(result.consignee, "TOPKOPY MIDDLE EAST FZE")
+
+    def test_port_of_loading_pol_suffix_line_break_form(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Port of Loading (POL)\nRUGAO/NANTONG/SHANGHAI, CHINA\n")
+        self.assertEqual(result.port_of_loading, "RUGAO/NANTONG/SHANGHAI, CHINA")
+
+    def test_bare_pol_line_break_form(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("POL\nPORT KLANG (WESTPORT), MALAYSIA\n")
+        self.assertEqual(result.port_of_loading, "PORT KLANG (WESTPORT), MALAYSIA")
+
+    def test_total_gross_wt_summary_line(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("TOTAL Gross Wt (kgs): 360,415 KG\n")
+        self.assertEqual(result.gross_weight_kg, 360415.0)
+
+    def test_full_pdf_block_layout_document_needs_no_llm_fallback(self):
+        with patch("pipeline.extract.extract_with_llm") as mock_llm:
+            result = extract_fields(PDF_BLOCK_LAYOUT_BL_TEXT)
+        mock_llm.assert_not_called()
+        self.assertEqual(result.shipper, "TEST EXPORTER LTD")
+        self.assertEqual(result.consignee, "TEST IMPORTER SDN BHD")
+        self.assertEqual(result.notify_party, "TEST IMPORTER SDN BHD")
+        self.assertEqual(result.port_of_loading, "SINGAPORE (SGSIN)")
+        self.assertEqual(result.port_of_discharge, "KARACHI, PAKISTAN (PKKHI)")
+        self.assertEqual(result.container_count, 3)
+        self.assertEqual(result.gross_weight_kg, 22000.0)
+
+
+class PdfBlockLayoutEndToEndComparisonTests(unittest.TestCase):
+    """Confirms the Tier 3 fix actually stops spurious defect_fields at the
+    process_email() level for PDF-block-layout documents -- not just in
+    extract_fields() isolation."""
+
+    def test_exact_match_with_pdf_block_layout_resolves_ok(self):
+        email = {
+            "email_id": "email_test_pdf_block_match",
+            "from": "ops@example.com",
+            "subject": "TO CONFIRM DOCS _ Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": PDF_BLOCK_LAYOUT_BL_TEXT.replace(
+                "BILL OF LADING (DRAFT)", "SHIPPING INSTRUCTION"
+            ).encode(),
+            "attachments/bl.txt": PDF_BLOCK_LAYOUT_BL_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "OK")
+        self.assertIsNone(result.review_reason)
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_genuine_mismatch_with_pdf_block_layout_has_no_spurious_fields(self):
+        email = {
+            "email_id": "email_test_pdf_block_mismatch",
+            "from": "ops@example.com",
+            "subject": "TO CONFIRM DOCS _ Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": PDF_BLOCK_LAYOUT_BL_TEXT.replace(
+                "BILL OF LADING (DRAFT)", "SHIPPING INSTRUCTION"
+            ).encode(),
+            "attachments/bl.txt": PDF_BLOCK_LAYOUT_BL_TEXT_DIFFERENT_CONSIGNEE.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "MISMATCH")
+        self.assertTrue(result.has_defect)
+        # Exactly the field that actually differs -- no bled address turning
+        # up as a spurious extra entry, no genuine defect masked either.
+        self.assertEqual(result.defect_fields, ["consignee"])
+
+
 class AltLabelEndToEndComparisonTests(unittest.TestCase):
     """Confirms exact match / mismatch behavior downstream of extraction is
     unchanged when documents use the previously-unmatched inline labels --

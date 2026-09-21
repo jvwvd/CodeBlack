@@ -61,6 +61,10 @@ def extract_fields(text: str) -> ShipmentFields:
         (
             r"^\s*Consignee(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Consignee(?:\s*\([^)]*\))*\s*$\n\s*([^|\n]+)",
+            # PDF block layout: label and value land on the same line with
+            # no colon/pipe when this (longer) label's rendered width
+            # leaves little horizontal gap before the value column.
+            r"^\s*Consignee\s*\(Non-Negotiable\)\s+([^|\n]+)",
             r"^\s*To the Order of\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*To the Order of\s*$\n\s*([^|\n]+)",
         ),
@@ -71,7 +75,8 @@ def extract_fields(text: str) -> ShipmentFields:
         (
             r"^\s*Notify Party(?:/Intermediate Consignee)?(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Notify(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
-            r"^\s*Notify Party\s*$\n\s*([^|\n]+)",
+            r"^\s*Notify Party(?:/Intermediate Consignee)?\s*$\n\s*([^|\n]+)",
+            r"^\s*Notify\s*$\n\s*([^|\n]+)",
         ),
     )
 
@@ -82,6 +87,8 @@ def extract_fields(text: str) -> ShipmentFields:
             r"^\s*POL(?:\s*\([^)]*\))*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Load Port\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Load Port\s*$\n\s*([^|\n]+)",
+            r"^\s*Port of Loading(?:\s*\(POL\))?\s*$\n\s*([^|\n]+)",
+            r"^\s*POL\s*$\n\s*([^|\n]+)",
         ),
     )
 
@@ -110,6 +117,11 @@ def extract_fields(text: str) -> ShipmentFields:
             r"^\s*Gross\s*Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Total Gross Weight[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
             r"^\s*Gross\s*Wt[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
+            # PDF summary line renders "TOTAL {label}:" with whichever
+            # weight label was randomly chosen -- the "Weight" spelling
+            # already matches via the "Total Gross Weight" pattern above,
+            # but the "Wt" abbreviation needs its own TOTAL-prefixed form.
+            r"^\s*TOTAL\s+Gross\s*Wt[^\n:]*\s*(?::|\|)\s*([^|\n]+)",
         ),
     )
 
