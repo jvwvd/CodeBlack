@@ -13,7 +13,8 @@ logic itself.
 from pathlib import PurePosixPath
 
 import database
-from models import EmailResult
+from models import EmailResult, ShipmentFields
+from pipeline import compare, normalize, reliability
 from pipeline.run import process_email
 
 
@@ -116,3 +117,56 @@ def process_and_persist_email(email_id: str) -> EmailResult | None:
 
     database.update_processing_state(email_id, "completed", last_error=None)
     return result
+
+
+def apply_review_correction(
+    email_id: str,
+    *,
+    si: ShipmentFields | None = None,
+    bl: ShipmentFields | None = None,
+    reviewer_notes: str | None = None,
+) -> dict | None:
+    """Apply a human reviewer's SI/BL correction to a stored email.
+
+    si/bl, when provided, replace the corresponding stored side entirely;
+    when omitted, the existing stored side (as last persisted by the
+    pipeline or a prior review) is kept. The resulting SI/BL pair is
+    re-verified with the existing deterministic pipeline.compare/
+    pipeline.reliability logic — never trusting a manually supplied
+    status — and persisted via database.save_review_correction().
+
+    Returns None if the email does not exist. Does not call
+    pipeline.run.process_email(): re-extraction/re-classification are out
+    of scope for a reviewer correction, only re-comparison of the
+    (possibly corrected) SI/BL pair already on file.
+    """
+    row = database.get_email(email_id)
+    if row is None:
+        return None
+
+    resolved_si = si if si is not None else ShipmentFields(**(row.get("si") or {}))
+    resolved_bl = bl if bl is not None else ShipmentFields(**(row.get("bl") or {}))
+
+    defects = compare.compare(
+        normalize.normalize_fields(resolved_si),
+        normalize.normalize_fields(resolved_bl),
+    )
+    missing_reason = reliability.check_missing_values(resolved_si, resolved_bl)
+
+    if missing_reason:
+        status = "NEEDS_REVIEW"
+        review_reason = missing_reason
+    else:
+        status = "MISMATCH" if defects else "OK"
+        review_reason = None
+
+    return database.save_review_correction(
+        email_id,
+        si=resolved_si,
+        bl=resolved_bl,
+        status=status,
+        defect_fields=defects,
+        has_defect=bool(defects),
+        review_reason=review_reason,
+        reviewer_notes=reviewer_notes if reviewer_notes is not None else row.get("reviewer_notes"),
+    )

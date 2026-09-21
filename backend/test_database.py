@@ -116,6 +116,76 @@ class UpsertEmailSourceTests(unittest.TestCase):
             database.upsert_email_source("")
 
 
+class SaveReviewCorrectionTests(unittest.TestCase):
+    def test_writes_exactly_the_review_columns(self):
+        resp = MagicMock(data=[{"email_id": "email_004", "status": "OK"}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            result = database.save_review_correction(
+                "email_004",
+                si={"shipper": "ACME"},
+                bl={"shipper": "ACME"},
+                status="OK",
+                defect_fields=[],
+                has_defect=False,
+                review_reason=None,
+                reviewer_notes="looks fine",
+            )
+        sent_row = table_mock.update.call_args.args[0]
+        self.assertEqual(
+            set(sent_row),
+            {"si", "bl", "status", "defect_fields", "has_defect", "review_reason", "reviewer_notes", "reviewed_at"},
+        )
+        for raw_field in ("sender", "subject", "body", "source_attachments", "processing_status", "retry_count", "last_error"):
+            self.assertNotIn(raw_field, sent_row)
+        self.assertEqual(sent_row["status"], "OK")
+        self.assertEqual(sent_row["reviewer_notes"], "looks fine")
+        self.assertIsInstance(sent_row["reviewed_at"], str)
+        table_mock.eq.assert_called_once_with("email_id", "email_004")
+        self.assertEqual(result, {"email_id": "email_004", "status": "OK"})
+
+    def test_pydantic_like_si_bl_are_serialized(self):
+        resp = MagicMock(data=[{"email_id": "email_004"}])
+        client, table_mock = _fake_client_with_table_chain(resp)
+
+        class FakeShipmentFields:
+            def model_dump(self, mode="python"):
+                return {"shipper": "ACME"}
+
+        with patch.object(database, "get_supabase_client", return_value=client):
+            database.save_review_correction(
+                "email_004",
+                si=FakeShipmentFields(),
+                bl=FakeShipmentFields(),
+                status="OK",
+                defect_fields=[],
+                has_defect=False,
+                review_reason=None,
+                reviewer_notes=None,
+            )
+        sent_row = table_mock.update.call_args.args[0]
+        self.assertEqual(sent_row["si"], {"shipper": "ACME"})
+        self.assertEqual(sent_row["bl"], {"shipper": "ACME"})
+
+    def test_no_matching_row_returns_none(self):
+        resp = MagicMock(data=[])
+        client, table_mock = _fake_client_with_table_chain(resp)
+        with patch.object(database, "get_supabase_client", return_value=client):
+            result = database.save_review_correction(
+                "email_missing",
+                si=None, bl=None, status="NEEDS_REVIEW", defect_fields=[],
+                has_defect=False, review_reason="missing_value", reviewer_notes=None,
+            )
+        self.assertIsNone(result)
+
+    def test_requires_non_empty_email_id(self):
+        with self.assertRaises(ValueError):
+            database.save_review_correction(
+                "", si=None, bl=None, status="OK", defect_fields=[],
+                has_defect=False, review_reason=None, reviewer_notes=None,
+            )
+
+
 class ListEmailsTests(unittest.TestCase):
     def test_no_filters_uses_defaults(self):
         resp = MagicMock(data=[])

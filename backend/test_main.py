@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 import database
 import main
 import orchestration
-from models import EmailResult
+from models import EmailResult, ShipmentFields
 
 client = TestClient(main.app, raise_server_exceptions=False)
 
@@ -193,6 +193,114 @@ class ProcessEmailEndpointTests(unittest.TestCase):
         self.assertEqual(response.json(), {"detail": "internal server error"})
         self.assertNotIn("SUPER_SECRET_VALUE", response.text)
         self.assertNotIn("RuntimeError", response.text)
+
+
+class ReviewEmailEndpointTests(unittest.TestCase):
+    def test_successful_correction_returns_200_with_updated_row(self):
+        fake_row = {
+            "email_id": "email_010", "status": "OK", "defect_fields": [], "has_defect": False,
+            "reviewer_notes": "confirmed", "reviewed_at": "2026-09-21T00:00:00+00:00",
+        }
+        with patch.object(orchestration, "apply_review_correction", return_value=fake_row) as mocked:
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={
+                    "si": {"shipper": "ACME"},
+                    "bl": {"shipper": "ACME"},
+                    "reviewer_notes": "confirmed",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), fake_row)
+        mocked.assert_called_once()
+        call_kwargs = mocked.call_args.kwargs
+        self.assertEqual(call_kwargs["si"], ShipmentFields(shipper="ACME"))
+        self.assertEqual(call_kwargs["bl"], ShipmentFields(shipper="ACME"))
+        self.assertEqual(call_kwargs["reviewer_notes"], "confirmed")
+        self.assertEqual(mocked.call_args.args, ("email_010",))
+
+    def test_review_resulting_in_ok(self):
+        fake_row = {"email_id": "email_010", "status": "OK", "defect_fields": [], "has_defect": False}
+        with patch.object(orchestration, "apply_review_correction", return_value=fake_row):
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={
+                    "si": {"shipper": "ACME"},
+                    "bl": {"shipper": "ACME"},
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "OK")
+
+    def test_review_resulting_in_mismatch(self):
+        fake_row = {
+            "email_id": "email_010", "status": "MISMATCH",
+            "defect_fields": ["shipper"], "has_defect": True,
+        }
+        with patch.object(orchestration, "apply_review_correction", return_value=fake_row):
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={"si": {"shipper": "ACME"}, "bl": {"shipper": "OTHER"}},
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "MISMATCH")
+        self.assertEqual(body["defect_fields"], ["shipper"])
+        self.assertTrue(body["has_defect"])
+
+    def test_missing_email_returns_404(self):
+        with patch.object(orchestration, "apply_review_correction", return_value=None):
+            response = client.patch(
+                "/api/emails/email_missing/review",
+                json={"reviewer_notes": "n/a"},
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("email_missing", response.json()["detail"])
+
+    def test_partial_correction_only_si_supplied(self):
+        with patch.object(orchestration, "apply_review_correction", return_value={"status": "OK"}) as mocked:
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={"si": {"shipper": "ACME"}},
+            )
+        self.assertEqual(response.status_code, 200)
+        call_kwargs = mocked.call_args.kwargs
+        self.assertEqual(call_kwargs["si"], ShipmentFields(shipper="ACME"))
+        self.assertIsNone(call_kwargs["bl"])
+
+    def test_partial_correction_only_bl_supplied(self):
+        with patch.object(orchestration, "apply_review_correction", return_value={"status": "OK"}) as mocked:
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={"bl": {"shipper": "ACME"}},
+            )
+        self.assertEqual(response.status_code, 200)
+        call_kwargs = mocked.call_args.kwargs
+        self.assertIsNone(call_kwargs["si"])
+        self.assertEqual(call_kwargs["bl"], ShipmentFields(shipper="ACME"))
+
+    def test_reviewer_notes_and_reviewed_at_round_trip_in_response(self):
+        fake_row = {
+            "email_id": "email_010", "status": "OK",
+            "reviewer_notes": "double-checked", "reviewed_at": "2026-09-21T12:00:00+00:00",
+        }
+        with patch.object(orchestration, "apply_review_correction", return_value=fake_row):
+            response = client.patch(
+                "/api/emails/email_010/review",
+                json={"reviewer_notes": "double-checked"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reviewer_notes"], "double-checked")
+        self.assertEqual(response.json()["reviewed_at"], "2026-09-21T12:00:00+00:00")
+
+    def test_empty_body_is_valid_and_forwards_all_none(self):
+        with patch.object(orchestration, "apply_review_correction", return_value={"status": "OK"}) as mocked:
+            response = client.patch("/api/emails/email_010/review", json={})
+        self.assertEqual(response.status_code, 200)
+        call_kwargs = mocked.call_args.kwargs
+        self.assertIsNone(call_kwargs["si"])
+        self.assertIsNone(call_kwargs["bl"])
+        self.assertIsNone(call_kwargs["reviewer_notes"])
 
 
 class ErrorHandlingTests(unittest.TestCase):

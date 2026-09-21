@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import database
 import orchestration
-from models import EmailResult
+from models import EmailResult, ShipmentFields
 
 
 class ProcessStoredEmailTests(unittest.TestCase):
@@ -279,6 +279,114 @@ class ProcessAndPersistEmailTests(unittest.TestCase):
             result = orchestration.process_and_persist_email("email_013")
 
         self.assertIs(result, fake_result)
+
+
+class ApplyReviewCorrectionTests(unittest.TestCase):
+    def _row(self, **overrides):
+        base = {
+            "email_id": "email_010",
+            "si": {
+                "shipper": "ACME", "consignee": "BETA CORP", "notify_party": "GAMMA",
+                "port_of_loading": "SGSIN", "port_of_discharge": "USNYC",
+                "container_count": 2, "gross_weight_kg": 100.0,
+            },
+            "bl": {
+                "shipper": "ACME", "consignee": "BETA CORP", "notify_party": "GAMMA",
+                "port_of_loading": "SGSIN", "port_of_discharge": "USNYC",
+                "container_count": 2, "gross_weight_kg": 100.0,
+            },
+            "reviewer_notes": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_missing_email_returns_none_and_never_saves(self):
+        with patch.object(database, "get_email", return_value=None), \
+             patch.object(database, "save_review_correction") as mocked_save:
+            result = orchestration.apply_review_correction(
+                "email_missing", si=None, bl=None, reviewer_notes="note"
+            )
+        self.assertIsNone(result)
+        mocked_save.assert_not_called()
+
+    def test_matching_si_bl_recomputes_ok(self):
+        row = self._row()
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={"email_id": "email_010", "status": "OK"}) as mocked_save:
+            result = orchestration.apply_review_correction("email_010", si=None, bl=None, reviewer_notes=None)
+
+        self.assertEqual(result, {"email_id": "email_010", "status": "OK"})
+        kwargs = mocked_save.call_args.kwargs
+        self.assertEqual(mocked_save.call_args.args, ("email_010",))
+        self.assertEqual(kwargs["status"], "OK")
+        self.assertEqual(kwargs["defect_fields"], [])
+        self.assertFalse(kwargs["has_defect"])
+        self.assertIsNone(kwargs["review_reason"])
+
+    def test_corrected_bl_causing_mismatch(self):
+        row = self._row()
+        corrected_bl = ShipmentFields(**{**row["bl"], "shipper": "Someone Else Ltd"})
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={"status": "MISMATCH"}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=None, bl=corrected_bl, reviewer_notes=None)
+
+        kwargs = mocked_save.call_args.kwargs
+        self.assertEqual(kwargs["status"], "MISMATCH")
+        self.assertIn("shipper", kwargs["defect_fields"])
+        self.assertTrue(kwargs["has_defect"])
+        self.assertIsNone(kwargs["review_reason"])
+
+    def test_partial_correction_keeps_stored_other_side(self):
+        row = self._row()
+        corrected_si = ShipmentFields(**{**row["si"]})
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=corrected_si, bl=None, reviewer_notes=None)
+
+        kwargs = mocked_save.call_args.kwargs
+        self.assertIs(kwargs["si"], corrected_si)
+        self.assertEqual(kwargs["bl"].shipper, row["bl"]["shipper"])
+        self.assertEqual(kwargs["bl"].gross_weight_kg, row["bl"]["gross_weight_kg"])
+        self.assertEqual(kwargs["status"], "OK")
+
+    def test_missing_required_value_forces_needs_review(self):
+        row = self._row()
+        incomplete_si = ShipmentFields(**{**row["si"], "container_count": None})
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=incomplete_si, bl=None, reviewer_notes=None)
+
+        kwargs = mocked_save.call_args.kwargs
+        self.assertEqual(kwargs["status"], "NEEDS_REVIEW")
+        self.assertEqual(kwargs["review_reason"], "missing_value")
+
+    def test_reviewer_notes_passed_through_when_provided(self):
+        row = self._row(reviewer_notes="old note")
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=None, bl=None, reviewer_notes="new note")
+
+        self.assertEqual(mocked_save.call_args.kwargs["reviewer_notes"], "new note")
+
+    def test_reviewer_notes_kept_when_not_provided(self):
+        row = self._row(reviewer_notes="existing note")
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=None, bl=None, reviewer_notes=None)
+
+        self.assertEqual(mocked_save.call_args.kwargs["reviewer_notes"], "existing note")
+
+    def test_no_stored_si_bl_and_no_correction_is_needs_review(self):
+        # An email that never reached comparison (e.g. still NEEDS_REVIEW from
+        # the pipeline for an unrelated reason) has no si/bl on file at all.
+        row = self._row(si=None, bl=None)
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=None, bl=None, reviewer_notes=None)
+
+        kwargs = mocked_save.call_args.kwargs
+        self.assertEqual(kwargs["status"], "NEEDS_REVIEW")
+        self.assertEqual(kwargs["review_reason"], "missing_value")
 
 
 class SafeErrorMessageTests(unittest.TestCase):
