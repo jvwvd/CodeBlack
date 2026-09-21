@@ -285,11 +285,13 @@ class PipelineRegressionTests(unittest.TestCase):
                 self.assertEqual(decided_by, "rule")
 
     def test_documented_invoice_subject_signals(self):
+        # "SD BILLING PROCESS COMPLETED" deliberately excluded here -- see
+        # RpaBillingNoticeIsNotInvoiceQueryTests below, it collides with the
+        # GENERAL "_RPA_ ... SD Billing Process Completed" template.
         subjects = (
             "REQUEST TO CANCEL INVOICE -5250075802",
             "RE_ LOCAL CHARGES FOB - KARGOSMAR - TELEX RELEASE CHARGES",
             "2157 RAK BILLING 5070146693 MISSING GR",
-            "_RPA_ India HSS SD Billing Process Completed - VISION",
             "Mill D & D charges - 6437419230",
         )
 
@@ -307,6 +309,61 @@ class PipelineRegressionTests(unittest.TestCase):
 
                 self.assertEqual(category, "INVOICE_QUERY")
                 self.assertEqual(decided_by, "rule")
+
+
+class RpaBillingNoticeIsNotInvoiceQueryTests(unittest.TestCase):
+    """Regression coverage for Tier 1 of the residual-error analysis: the
+    organizer's GENERAL RPA billing-completion notice template
+    ("_RPA_ ... SD Billing Process Completed - <vessel>") was being
+    force-classified INVOICE_QUERY by a rule signal before the LLM ever got
+    a chance to abstain to GENERAL."""
+
+    def test_rpa_billing_notice_is_not_rule_forced_to_invoice_query(self):
+        subjects = (
+            "_RPA_ India HSS SD Billing Process Completed - VISION",
+            "_RPA_ India HSS SD Billing Process Completed - LE HAVRE V.QI540A",
+            "_RPA_ India HSS SD Billing Process Completed - MARCOPOLO 810 V.BS005",
+        )
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                email = {
+                    "email_id": "email_test_rpa_billing",
+                    "from": "rpa.bot@example.com",
+                    "subject": subject,
+                    "body": (
+                        "This is an automated notification. The India HSS SD "
+                        "Billing Process has completed successfully. No action required.\n\n-- RPA Bot"
+                    ),
+                    "attachments": [],
+                }
+
+                # LLM unavailable/mocked out: proves the RULE layer no
+                # longer force-matches this subject, independent of what a
+                # live AI provider would say -- the safe deterministic
+                # fallback is GENERAL, per classify_email()'s own contract.
+                with patch("pipeline.classify.classify_with_llm", return_value=None):
+                    category, decided_by = classify_email(email)
+
+                self.assertEqual(category, "GENERAL")
+                self.assertEqual(decided_by, "rule")
+
+    def test_rpa_billing_notice_still_defers_to_llm_when_available(self):
+        # When the AI provider IS available, the rule layer must not have
+        # already forced a (wrong) verdict -- classify_with_llm() must
+        # actually be consulted for this subject now.
+        email = {
+            "email_id": "email_test_rpa_billing_llm",
+            "from": "rpa.bot@example.com",
+            "subject": "_RPA_ India HSS SD Billing Process Completed - VISION",
+            "body": "This is an automated notification. No action required.\n\n-- RPA Bot",
+            "attachments": [],
+        }
+        with patch("pipeline.classify.classify_with_llm", return_value="GENERAL") as mock_llm:
+            category, decided_by = classify_email(email)
+
+        mock_llm.assert_called_once()
+        self.assertEqual(category, "GENERAL")
+        self.assertEqual(decided_by, "llm")
 
 
 SI_TEXT_MISSING_WEIGHT = """

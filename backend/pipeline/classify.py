@@ -80,11 +80,16 @@ def classify_email(email: dict) -> tuple[Category, str]:
     if si_subject_signal or si_dash_subject:
         return "SI_REQUEST", "rule"
 
+    # "SD BILLING PROCESS COMPLETED" was removed: it also matches the
+    # organizer's GENERAL "_RPA_ ... SD Billing Process Completed - <vessel>"
+    # RPA billing-completion notice template, forcing that rule branch on 9
+    # emails before the LLM ever got a chance to abstain. It never matched
+    # any genuine invoice-query subject in this dataset, so removing it is
+    # loss-free for true INVOICE_QUERY detection.
     invoice_subject_signals = (
         "REQUEST TO CANCEL INVOICE",
         "LOCAL CHARGES FOB",
         "RAK BILLING",
-        "SD BILLING PROCESS COMPLETED",
         "MILL D & D CHARGES",
     )
 
