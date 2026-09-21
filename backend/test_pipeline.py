@@ -1,10 +1,10 @@
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 import pymupdf
 from docx import Document
 from openpyxl import Workbook
-from io import BytesIO
 
 from pipeline.classify import classify_email
 from pipeline.documents import (
@@ -241,6 +241,68 @@ class PipelineRegressionTests(unittest.TestCase):
 
         mock_vision.assert_called_once()
         self.assertIsNone(text)
+
+    def test_si_request_subject_beats_invoice_text_in_body(self):
+        body = """
+        Please find the shipping instruction attached.
+
+        Documents Required:
+        1) 3 Original invoice
+        2) Packing list
+        3) Original BL
+
+        Forwarded thread also mentions billing and payment.
+        """
+
+        subjects = (
+            "CUST SI _ MEA _ 5RCY-52735 __ PO_25_5465",
+            "RE_ CUST SI _ MEA _ 5RCY-51168 __ PO_25_3508",
+            "REQUEST SI _ 5APH-62718 _ HOUSTON_US",
+            "RE_ REQUEST SI _ 5RCY-60883 _ CONAKRY_GUINEA",
+            "SI NEEDED_ 5RUS-16202 _ EAST BRIGHT",
+            "RE_ SI NEEDED_ 5APH-26773 _ UAB NOVAKOPA",
+            "SI - HLCUSIN331541006 - DIRECT(HAPAG) - 5RUS-61793",
+            "RE_ SI - SIJ3777014 - DIRECT(CMA) - 5ALT-88568",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                email = {
+                    "email_id": "email_test_si_request",
+                    "from": "ops@example.com",
+                    "subject": subject,
+                    "body": body,
+                    "attachments": [],
+                }
+
+                category, decided_by = classify_email(email)
+
+                self.assertEqual(category, "SI_REQUEST")
+                self.assertEqual(decided_by, "rule")
+
+    def test_documented_invoice_subject_signals(self):
+        subjects = (
+            "REQUEST TO CANCEL INVOICE -5250075802",
+            "RE_ LOCAL CHARGES FOB - KARGOSMAR - TELEX RELEASE CHARGES",
+            "2157 RAK BILLING 5070146693 MISSING GR",
+            "_RPA_ India HSS SD Billing Process Completed - VISION",
+            "Mill D & D charges - 6437419230",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                email = {
+                    "email_id": "email_test_invoice",
+                    "from": "ops@example.com",
+                    "subject": subject,
+                    "body": "Normal forwarded operational thread.",
+                    "attachments": [],
+                }
+
+                category, decided_by = classify_email(email)
+
+                self.assertEqual(category, "INVOICE_QUERY")
+                self.assertEqual(decided_by, "rule")
 
 
 if __name__ == "__main__":
