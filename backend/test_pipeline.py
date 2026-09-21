@@ -12,6 +12,7 @@ from pipeline.documents import (
     identify_doc_type,
     parse_attachment_bytes,
 )
+from pipeline.extract import extract_fields
 from pipeline.run import _finalize, process_email
 from models import EmailResult
 
@@ -636,6 +637,157 @@ class MissingAttachmentReliabilityTests(unittest.TestCase):
         self.assertEqual(result.review_reason, "missing_attachment")
         self.assertFalse(result.has_defect)
         self.assertEqual(result.defect_fields, [])
+
+
+ALT_LABEL_SI_TEXT = """
+SHIPPING INSTRUCTION
+
+Shipper: TEST EXPORTER LTD
+To the Order of: TEST IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Load Port: SINGAPORE
+Port of Discharge: KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+Gross Wt (kgs): 22,000 KG
+"""
+
+ALT_LABEL_BL_TEXT = """
+DRAFT BILL OF LADING
+
+Shipper: TEST EXPORTER LTD
+To the Order of: TEST IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Load Port: SINGAPORE
+Port of Discharge: KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+Gross Wt (kgs): 22,000 KG
+"""
+
+ALT_LABEL_BL_TEXT_DIFFERENT_CONSIGNEE = """
+DRAFT BILL OF LADING
+
+Shipper: TEST EXPORTER LTD
+To the Order of: DIFFERENT IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Load Port: SINGAPORE
+Port of Discharge: KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+Gross Wt (kgs): 22,000 KG
+"""
+
+
+class ExtractFieldsLabelCoverageTests(unittest.TestCase):
+    """Regression coverage for the confirmed extraction regex gaps found in
+    the E2E diagnosis: 'To the Order of' (consignee), 'Load Port'
+    (port_of_loading), and 'Gross Wt' (gross_weight_kg) are always rendered
+    INLINE ("Label: value" on one line) by the organizer's generator, but
+    the old patterns only matched a label-alone-then-newline-value form for
+    the first two, and had no pattern at all for the 'Wt' abbreviation."""
+
+    def test_to_the_order_of_inline_label_is_extracted(self):
+        # A single-field snippet: the other six fields are genuinely absent,
+        # so extract_fields() still consults its LLM fallback for THOSE --
+        # mocked here to stay deterministic/offline -- but consignee itself
+        # was already resolved by the (new) regex pattern before that
+        # fallback ever runs, so the mock's return value cannot affect it.
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("To the Order of: TOPKOPY MIDDLE EAST FZE\n")
+        self.assertEqual(result.consignee, "TOPKOPY MIDDLE EAST FZE")
+
+    def test_load_port_inline_label_is_extracted(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Load Port: NHAVA SHEVA, INDIA (INNSA)\n")
+        self.assertEqual(result.port_of_loading, "NHAVA SHEVA, INDIA (INNSA)")
+
+    def test_gross_wt_kgs_inline_label_is_extracted(self):
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            result = extract_fields("Gross Wt (kgs): 222,690 KG\n")
+        self.assertEqual(result.gross_weight_kg, 222690.0)
+
+    def test_existing_line_break_form_still_supported(self):
+        # Preserve the pre-existing label-alone-then-newline-value form for
+        # the same two labels (unchanged patterns, still present in the tuple).
+        with patch("pipeline.extract.extract_with_llm", return_value=None):
+            consignee_result = extract_fields("To the Order of\nTOPKOPY MIDDLE EAST FZE\n")
+            port_result = extract_fields("Load Port\nNHAVA SHEVA, INDIA (INNSA)\n")
+        self.assertEqual(consignee_result.consignee, "TOPKOPY MIDDLE EAST FZE")
+        self.assertEqual(port_result.port_of_loading, "NHAVA SHEVA, INDIA (INNSA)")
+
+    def test_existing_standard_labels_still_extract_correctly(self):
+        # Regression guard: the standard labels used everywhere else in this
+        # file (Consignee:, Port of Loading:, Gross Weight (KG):) must be
+        # completely unaffected by the newly-added patterns.
+        with patch("pipeline.extract.extract_with_llm") as mock_llm:
+            result = extract_fields(SI_TEXT)
+        mock_llm.assert_not_called()
+        self.assertEqual(result.shipper, "TEST EXPORTER LTD")
+        self.assertEqual(result.consignee, "TEST IMPORTER SDN BHD")
+        self.assertEqual(result.notify_party, "TEST IMPORTER SDN BHD")
+        self.assertEqual(result.port_of_loading, "SINGAPORE")
+        self.assertEqual(result.port_of_discharge, "KARACHI, PAKISTAN (PKKHI)")
+        self.assertEqual(result.container_count, 3)
+        self.assertEqual(result.gross_weight_kg, 22000.0)
+
+    def test_full_document_with_all_three_alt_labels_needs_no_llm_fallback(self):
+        # All seven fields present via a mix of standard + the three
+        # previously-unmatched inline label variants: extraction must be
+        # fully deterministic (regex-only), matching extract_fields()'s own
+        # "Gemini only fills fields deterministic extraction missed" contract.
+        with patch("pipeline.extract.extract_with_llm") as mock_llm:
+            result = extract_fields(ALT_LABEL_SI_TEXT)
+        mock_llm.assert_not_called()
+        self.assertEqual(result.consignee, "TEST IMPORTER SDN BHD")
+        self.assertEqual(result.port_of_loading, "SINGAPORE")
+        self.assertEqual(result.gross_weight_kg, 22000.0)
+        self.assertTrue(all(v is not None for v in result.model_dump().values()))
+
+
+class AltLabelEndToEndComparisonTests(unittest.TestCase):
+    """Confirms exact match / mismatch behavior downstream of extraction is
+    unchanged when documents use the previously-unmatched inline labels --
+    the fix must not introduce new false matches or false mismatches."""
+
+    def test_exact_match_with_alt_labels_resolves_ok(self):
+        email = {
+            "email_id": "email_test_alt_label_match",
+            "from": "ops@example.com",
+            "subject": "TO CONFIRM DOCS _ Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": ALT_LABEL_SI_TEXT.encode(),
+            "attachments/bl.txt": ALT_LABEL_BL_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "OK")
+        self.assertIsNone(result.review_reason)
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_genuine_mismatch_with_alt_labels_is_caught_with_exact_fields(self):
+        email = {
+            "email_id": "email_test_alt_label_mismatch",
+            "from": "ops@example.com",
+            "subject": "TO CONFIRM DOCS _ Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": ALT_LABEL_SI_TEXT.encode(),
+            "attachments/bl.txt": ALT_LABEL_BL_TEXT_DIFFERENT_CONSIGNEE.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "MISMATCH")
+        self.assertIsNone(result.review_reason)
+        self.assertTrue(result.has_defect)
+        # Exactly the field that actually differs -- no spurious extras from
+        # a bled label/address, no missing genuine defect.
+        self.assertEqual(result.defect_fields, ["consignee"])
 
 
 if __name__ == "__main__":
