@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 import database
 import orchestration
 from config import settings
+from models import ReviewCorrectionRequest
 
 logger = logging.getLogger("sdoc.backend")
 
@@ -81,3 +82,24 @@ def process_email_endpoint(email_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail=f"email not found: {email_id}")
     return result
+
+
+@app.post("/api/emails/{email_id}/retry")
+def retry_email_endpoint(email_id: str):
+    result = orchestration.retry_and_persist_email(email_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"email not found: {email_id}")
+    return result
+
+
+@app.patch("/api/emails/{email_id}/review")
+def review_email_endpoint(email_id: str, body: ReviewCorrectionRequest):
+    updated = orchestration.apply_review_correction(
+        email_id,
+        si=body.si,
+        bl=body.bl,
+        reviewer_notes=body.reviewer_notes,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"email not found: {email_id}")
+    return updated

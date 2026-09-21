@@ -46,3 +46,15 @@ class EmailResult(BaseModel):
     review_reason: Optional[ReviewReason] = None
     decided_by: Optional[Literal["rule", "llm"]] = None
     notes: Optional[str] = None
+
+
+class ReviewCorrectionRequest(BaseModel):
+    """PATCH /api/emails/{email_id}/review request body.
+
+    si/bl are whole-side corrections: when provided, they replace the
+    stored side entirely (not merged field-by-field); when omitted, the
+    existing stored side is kept unchanged.
+    """
+    si: Optional[ShipmentFields] = None
+    bl: Optional[ShipmentFields] = None
+    reviewer_notes: Optional[str] = None

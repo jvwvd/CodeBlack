@@ -13,7 +13,8 @@ logic itself.
 from pathlib import PurePosixPath
 
 import database
-from models import EmailResult
+from models import EmailResult, ShipmentFields
+from pipeline import compare, normalize, reliability
 from pipeline.run import process_email
 
 
@@ -116,3 +117,83 @@ def process_and_persist_email(email_id: str) -> EmailResult | None:
 
     database.update_processing_state(email_id, "completed", last_error=None)
     return result
+
+
+def retry_and_persist_email(email_id: str) -> EmailResult | None:
+    """Manually re-run processing for one email from the dashboard.
+
+    Bumps retry_count exactly once for this attempt via
+    database.increment_retry_count(), then reuses
+    process_and_persist_email() unchanged for the actual processing/
+    persistence and processing_status/last_error handling — this function
+    implements no classification/extraction/comparison logic of its own
+    and adds no automatic/background retries of any kind.
+
+    Returns None (without incrementing retry_count) if the email does not
+    exist. On failure, process_and_persist_email() marks
+    processing_status='failed' with a safe error summary and re-raises;
+    the retry_count bumped here was already written and is preserved.
+    """
+    if database.get_email(email_id) is None:
+        return None
+
+    database.increment_retry_count(email_id)
+    return process_and_persist_email(email_id)
+
+
+def apply_review_correction(
+    email_id: str,
+    *,
+    si: ShipmentFields | None = None,
+    bl: ShipmentFields | None = None,
+    reviewer_notes: str | None = None,
+) -> dict | None:
+    """Apply a human reviewer's SI/BL correction to a stored email.
+
+    si/bl, when provided, replace the corresponding stored side entirely;
+    when omitted, the existing stored side (as last persisted by the
+    pipeline or a prior review) is kept. The resulting SI/BL pair is
+    re-verified with the existing deterministic pipeline.compare/
+    pipeline.reliability logic — never trusting a manually supplied
+    status — and persisted via database.save_review_correction().
+
+    Returns None if the email does not exist. Does not call
+    pipeline.run.process_email(): re-extraction/re-classification are out
+    of scope for a reviewer correction, only re-comparison of the
+    (possibly corrected) SI/BL pair already on file.
+    """
+    row = database.get_email(email_id)
+    if row is None:
+        return None
+
+    resolved_si = si if si is not None else ShipmentFields(**(row.get("si") or {}))
+    resolved_bl = bl if bl is not None else ShipmentFields(**(row.get("bl") or {}))
+
+    defects = compare.compare(
+        normalize.normalize_fields(resolved_si),
+        normalize.normalize_fields(resolved_bl),
+    )
+    missing_reason = reliability.check_missing_values(resolved_si, resolved_bl)
+
+    if missing_reason:
+        # Same invariant pipeline.run._finalize() enforces: review_reason
+        # means verification did not complete, so any provisional defects
+        # from comparing a field that turned out to be missing are not
+        # authoritative and must not be reported alongside NEEDS_REVIEW.
+        status = "NEEDS_REVIEW"
+        review_reason = missing_reason
+        defects = []
+    else:
+        status = "MISMATCH" if defects else "OK"
+        review_reason = None
+
+    return database.save_review_correction(
+        email_id,
+        si=resolved_si,
+        bl=resolved_bl,
+        status=status,
+        defect_fields=defects,
+        has_defect=bool(defects),
+        review_reason=review_reason,
+        reviewer_notes=reviewer_notes if reviewer_notes is not None else row.get("reviewer_notes"),
+    )

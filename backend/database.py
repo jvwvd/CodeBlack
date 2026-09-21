@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -90,6 +91,49 @@ def upsert_email(result: Any) -> dict:
     return response.data[0] if response.data else row
 
 
+def save_review_correction(
+    email_id: str,
+    *,
+    si: Any,
+    bl: Any,
+    status: str,
+    defect_fields: list[str],
+    has_defect: bool,
+    review_reason: str | None,
+    reviewer_notes: str | None,
+) -> dict | None:
+    """Persist a human reviewer's SI/BL correction and its recomputed
+    result fields, plus reviewer_notes and a fresh reviewed_at timestamp.
+
+    Deliberately separate from upsert_email(): reviewed_at/reviewer_notes
+    are excluded from upsert_email()'s canonical EmailResult field set
+    (_EMAIL_RESULT_FIELDS), and this never writes the raw source columns
+    (sender/subject/body/source_attachments) or processing_status/
+    retry_count/last_error. Returns None if email_id does not match any row.
+    """
+    if not email_id:
+        raise ValueError("save_review_correction() requires a non-empty 'email_id'")
+
+    row = {
+        "si": _jsonable(si),
+        "bl": _jsonable(bl),
+        "status": status,
+        "defect_fields": defect_fields,
+        "has_defect": has_defect,
+        "review_reason": review_reason,
+        "reviewer_notes": reviewer_notes,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    client = get_supabase_client()
+    response = (
+        client.table("emails")
+        .update(row)
+        .eq("email_id", email_id)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
 def upsert_email_source(
     email_id: str,
     *,
@@ -167,6 +211,29 @@ def update_processing_state(
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def increment_retry_count(email_id: str) -> dict | None:
+    """Bump retry_count by exactly 1 for one manual retry attempt.
+
+    Reads the current retry_count and writes back current + 1 (missing/
+    None treated as 0). Touches only retry_count — never processing_status
+    or last_error, which process_and_persist_email() manages itself right
+    after this is called. Returns None if the email does not exist.
+    """
+    row = get_email(email_id)
+    if row is None:
+        return None
+
+    next_count = (row.get("retry_count") or 0) + 1
+    client = get_supabase_client()
+    response = (
+        client.table("emails")
+        .update({"retry_count": next_count})
+        .eq("email_id", email_id)
+        .execute()
+    )
+    return response.data[0] if response.data else {**row, "retry_count": next_count}
 
 
 def create_attachment_record(

@@ -73,18 +73,45 @@ def _result_to_dict(result) -> dict:
     return result.dict()
 
 
-def _process_with_retries(process_email, email: dict, retries: int) -> dict:
+def _load_attachment_bytes(email: dict, data_dir: str) -> tuple[dict[str, bytes], list[str]]:
+    """Load each attachment referenced by email["attachments"] from data_dir.
+
+    Keys are the ORIGINAL organizer attachment references exactly as they
+    appear in email["attachments"] (e.g. "attachments/email_512_SI.pdf"),
+    each resolved as Path(data_dir) / ref. Never guesses alternate
+    filenames or basenames. A missing/unreadable attachment is skipped
+    (not fabricated) and its reference + error recorded in the returned
+    problem list, so the pipeline's own reliability checks see a smaller
+    (or empty) attachment_bytes dict instead of the whole run crashing.
+    """
+    attachment_bytes: dict[str, bytes] = {}
+    problems: list[str] = []
+    for ref in email.get("attachments") or []:
+        try:
+            attachment_bytes[ref] = (Path(data_dir) / ref).read_bytes()
+        except OSError as exc:
+            problems.append(f"{ref}: {type(exc).__name__}: {exc}")
+    return attachment_bytes, problems
+
+
+def _process_with_retries(process_email, email: dict, retries: int, data_dir: str) -> dict:
     attempts = retries + 1
     last_error = None
+    attachment_bytes, attachment_problems = _load_attachment_bytes(email, data_dir)
     start = time.time()
     for attempt in range(attempts):
         try:
-            result = process_email(email)
+            result = process_email(email, attachment_bytes=attachment_bytes)
             seconds = time.time() - start
+            result_dict = _result_to_dict(result)
+            if attachment_problems:
+                # Diagnostic-only key on the saved output, not part of the
+                # pipeline's EmailResult contract (PROJECT_RULES.md section 7).
+                result_dict["attachment_problems"] = attachment_problems
             return {
                 "ok": True,
                 "email_id": email["email_id"],
-                "result": _result_to_dict(result),
+                "result": result_dict,
                 "seconds": seconds,
             }
         except Exception as exc:
@@ -92,12 +119,15 @@ def _process_with_retries(process_email, email: dict, retries: int) -> dict:
             if attempt < attempts - 1:
                 time.sleep(RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)])
     seconds = time.time() - start
-    return {
+    record = {
         "ok": False,
         "email_id": email["email_id"],
         "error": last_error,
         "seconds": seconds,
     }
+    if attachment_problems:
+        record["attachment_problems"] = attachment_problems
+    return record
 
 
 def _load_existing(out_path: Path) -> list[dict]:
@@ -187,7 +217,9 @@ def main() -> int:
     if to_process:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(_process_with_retries, process_email, emails_by_id[eid], args.retries): eid
+                pool.submit(
+                    _process_with_retries, process_email, emails_by_id[eid], args.retries, args.data_dir
+                ): eid
                 for eid in to_process
             }
             for future in as_completed(futures):

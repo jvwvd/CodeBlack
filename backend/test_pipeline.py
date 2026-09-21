@@ -11,7 +11,8 @@ from pipeline.documents import (
     identify_doc_type,
     parse_attachment_bytes,
 )
-from pipeline.run import process_email
+from pipeline.run import _finalize, process_email
+from models import EmailResult
 
 
 SI_TEXT = """
@@ -241,6 +242,139 @@ class PipelineRegressionTests(unittest.TestCase):
 
         mock_vision.assert_called_once()
         self.assertIsNone(text)
+
+
+SI_TEXT_MISSING_WEIGHT = """
+SHIPPING INSTRUCTION
+
+Shipper: TEST EXPORTER LTD
+Consignee: TEST IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Port of Loading: SINGAPORE
+Port of Discharge: KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+"""
+
+BL_TEXT_DIFFERENT_CONSIGNEE = """
+DRAFT BILL OF LADING
+
+Shipper: TEST EXPORTER LTD
+Consignee: DIFFERENT IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Port of Loading: SINGAPORE
+Port of Discharge: KARACHI, PAKISTAN (PKKHI)
+Container Count: 3
+Gross Weight: 22000 KG
+"""
+
+
+class DefectReviewInvariantTests(unittest.TestCase):
+    """Organizer README invariant: has_defect/defect_fields are reported
+    for MISMATCH, review_reason is reported for NEEDS_REVIEW -- never
+    both. Regression coverage for email_040/email_516/email_518, which
+    previously came back NEEDS_REVIEW + review_reason=missing_value while
+    still carrying has_defect=true and a non-empty defect_fields list."""
+
+    @patch("pipeline.extract.extract_with_llm", return_value=None)
+    def test_missing_si_weight_with_apparent_differences_is_clean_needs_review(self, mock_llm):
+        # SI is missing gross weight (required field) AND consignee genuinely
+        # differs from BL -- the exact shape that used to leak has_defect/
+        # defect_fields alongside NEEDS_REVIEW.
+        email = {
+            "email_id": "email_test_missing_weight",
+            "from": "ops@example.com",
+            "subject": "Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT_MISSING_WEIGHT.encode(),
+            "attachments/bl.txt": BL_TEXT_DIFFERENT_CONSIGNEE.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "NEEDS_REVIEW")
+        self.assertEqual(result.review_reason, "missing_value")
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_real_mismatch_with_complete_data_still_reports_defects(self):
+        # Both sides fully readable/complete, genuine difference on consignee:
+        # must remain MISMATCH with has_defect/defect_fields populated and
+        # no review_reason.
+        email = {
+            "email_id": "email_test_real_mismatch",
+            "from": "ops@example.com",
+            "subject": "Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT.encode(),
+            "attachments/bl.txt": BL_TEXT_DIFFERENT_CONSIGNEE.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "MISMATCH")
+        self.assertIsNone(result.review_reason)
+        self.assertTrue(result.has_defect)
+        self.assertIn("consignee", result.defect_fields)
+
+    def test_exact_match_remains_ok_with_no_defect_markers(self):
+        email = {
+            "email_id": "email_test_exact_match",
+            "from": "ops@example.com",
+            "subject": "Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": SI_TEXT.encode(),
+            "attachments/bl.txt": BL_TEXT.encode(),
+        }
+
+        result = process_email(email, attachment_bytes=attachment_bytes)
+
+        self.assertEqual(result.status, "OK")
+        self.assertIsNone(result.review_reason)
+        self.assertFalse(result.has_defect)
+        self.assertEqual(result.defect_fields, [])
+
+    def test_finalize_strips_defects_whenever_review_reason_is_set(self):
+        # Direct unit coverage of the guard itself, independent of how the
+        # (possibly stale) has_defect/defect_fields got onto the result.
+        leaky = EmailResult(
+            email_id="email_leaky",
+            category="BL_COMPARISON",
+            status="NEEDS_REVIEW",
+            defect_fields=["consignee", "gross_weight_kg"],
+            has_defect=True,
+            review_reason="missing_value",
+        )
+
+        cleaned = _finalize(leaky)
+
+        self.assertEqual(cleaned.status, "NEEDS_REVIEW")
+        self.assertFalse(cleaned.has_defect)
+        self.assertEqual(cleaned.defect_fields, [])
+
+    def test_finalize_leaves_mismatch_result_untouched(self):
+        clean = EmailResult(
+            email_id="email_clean",
+            category="BL_COMPARISON",
+            status="MISMATCH",
+            defect_fields=["shipper"],
+            has_defect=True,
+            review_reason=None,
+        )
+
+        result = _finalize(clean)
+
+        self.assertEqual(result.status, "MISMATCH")
+        self.assertTrue(result.has_defect)
+        self.assertEqual(result.defect_fields, ["shipper"])
 
 
 if __name__ == "__main__":
