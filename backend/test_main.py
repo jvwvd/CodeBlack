@@ -9,7 +9,10 @@ Supabase client, network call, or credential is ever touched.
 Run from inside backend/:
     python -m unittest -v test_main
 """
+import io
+import json
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -390,6 +393,613 @@ class CorsTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:5173")
+
+
+class ExportEmailsEndpointTests(unittest.TestCase):
+    _FAKE_ROWS = [
+        {
+            "email_id": "email_004",
+            "sender": "a@b.com",
+            "subject": "SI request",
+            "category": "BL_COMPARISON",
+            "status": "MISMATCH",
+            "review_reason": None,
+            "has_defect": True,
+            "defect_fields": ["shipper", "consignee"],
+            "decided_by": "rule",
+            "updated_at": "2026-09-21T00:00:00+00:00",
+            "si": {"shipper": "ACME SI", "consignee": "C1"},
+            "bl": {"shipper": "ACME BL", "consignee": "C1"},
+        },
+        {
+            "email_id": "email_005",
+            "sender": None,
+            "subject": "not yet processed",
+            "category": None,
+            "status": None,
+            "review_reason": None,
+            "has_defect": None,
+            "defect_fields": None,
+            "decided_by": None,
+            "updated_at": None,
+            "si": None,
+            "bl": None,
+        },
+    ]
+
+    def test_default_json_export_returns_flat_rows_with_download_header(self):
+        with patch.object(database, "list_emails", return_value=self._FAKE_ROWS) as mocked:
+            response = client.get("/api/emails/export")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertTrue(response.headers["content-disposition"].startswith("attachment; filename=codeblack_results_"))
+        self.assertTrue(response.headers["content-disposition"].endswith(".json"))
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id=None, limit=main.EXPORT_MAX_ROWS
+        )
+
+        rows = response.json()
+        self.assertEqual(len(rows), 2)
+        processed, unprocessed = rows
+        self.assertEqual(processed["email_id"], "email_004")
+        self.assertEqual(processed["si_shipper"], "ACME SI")
+        self.assertEqual(processed["bl_shipper"], "ACME BL")
+        self.assertEqual(processed["si_consignee"], "C1")
+        self.assertEqual(processed["defect_fields"], ["shipper", "consignee"])
+        # An unprocessed email is included with empty/None result columns, not omitted.
+        self.assertEqual(unprocessed["email_id"], "email_005")
+        self.assertIsNone(unprocessed["category"])
+        self.assertIsNone(unprocessed["si_shipper"])
+        self.assertIsNone(unprocessed["bl_shipper"])
+        self.assertEqual(unprocessed["defect_fields"], [])
+
+    def test_csv_export_has_header_and_one_data_row(self):
+        with patch.object(database, "list_emails", return_value=self._FAKE_ROWS[:1]):
+            response = client.get("/api/emails/export?format=csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertTrue(response.headers["content-disposition"].endswith(".csv"))
+
+        lines = response.text.strip("\r\n").split("\r\n")
+        self.assertEqual(len(lines), 2)
+        header, row = lines
+        self.assertEqual(header.split(","), main.EXPORT_COLUMNS)
+        cells = row.split(",")
+        self.assertEqual(cells[0], "email_004")
+        self.assertIn("shipper;consignee", row)  # defect_fields joined with ";"
+
+    def test_filters_forwarded_to_list_emails(self):
+        with patch.object(database, "list_emails", return_value=[]) as mocked:
+            client.get("/api/emails/export?status=MISMATCH&category=BL_COMPARISON")
+        mocked.assert_called_once_with(
+            status="MISMATCH", category="BL_COMPARISON", processing_status=None, batch_id=None, limit=main.EXPORT_MAX_ROWS
+        )
+
+    def test_route_declared_before_single_email_route(self):
+        # If /api/emails/export were declared after /api/emails/{email_id},
+        # FastAPI would match "export" as an email_id and call
+        # database.get_email("export") instead of database.list_emails().
+        with patch.object(database, "get_email", side_effect=AssertionError("must not hit the {email_id} route")), \
+             patch.object(database, "list_emails", return_value=[]) as mocked_list:
+            response = client.get("/api/emails/export")
+        self.assertEqual(response.status_code, 200)
+        mocked_list.assert_called_once()
+
+
+class UploadEmailEndpointTests(unittest.TestCase):
+    def test_upload_with_txt_pair_creates_record_and_processes(self):
+        fake_result = EmailResult(email_id="placeholder", category="SI_REQUEST", status="OK")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record") as mocked_attach, \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result) as mocked_process:
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test SI/BL", "body": "please verify", "sender": "x@y.com"},
+                files=[
+                    ("files", ("si.txt", b"SI content", "text/plain")),
+                    ("files", ("bl.txt", b"BL content", "text/plain")),
+                ],
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), fake_result.model_dump(mode="json"))
+
+        self.assertEqual(mocked_upload.call_count, 2)
+        self.assertEqual(mocked_attach.call_count, 2)
+        mocked_source.assert_called_once()
+        source_kwargs = mocked_source.call_args.kwargs
+        self.assertEqual(source_kwargs["sender"], "x@y.com")
+        self.assertEqual(source_kwargs["subject"], "Test SI/BL")
+        self.assertEqual(source_kwargs["body"], "please verify")
+        self.assertEqual(source_kwargs["source_attachments"], ["si.txt", "bl.txt"])
+
+        email_id = mocked_source.call_args.args[0]
+        self.assertTrue(email_id.startswith("upload_"))
+        mocked_process.assert_called_once_with(email_id)
+
+    def test_unrecognized_extension_is_accepted_and_passed_through(self):
+        # Task 1 changes this deliberately: an unrecognized/unsupported file
+        # type (image, .doc, unknown extension, etc.) is no longer an
+        # upload-time error. It is stored and attached to the new email like
+        # any other file; the pipeline marks that email NEEDS_REVIEW/
+        # unreadable downstream — that is the expected outcome, not a 400.
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="NEEDS_REVIEW")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record") as mocked_attach, \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test", "body": "body"},
+                files=[("files", ("mystery.exe", b"x", "application/octet-stream"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        mocked_upload.assert_called_once()
+        mocked_attach.assert_called_once()
+        mocked_source.assert_called_once()
+        self.assertEqual(mocked_source.call_args.kwargs["source_attachments"], ["mystery.exe"])
+
+    def test_oversize_file_returns_413_and_persists_nothing(self):
+        oversize = b"x" * (main.MAX_UPLOAD_FILE_BYTES + 1)
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "upsert_email_source") as mocked_source:
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test", "body": "body"},
+                files=[("files", ("big.txt", oversize, "text/plain"))],
+            )
+        self.assertEqual(response.status_code, 413)
+        mocked_upload.assert_not_called()
+        mocked_source.assert_not_called()
+
+    def test_too_many_files_returns_413(self):
+        files = [("files", (f"f{i}.txt", b"x", "text/plain")) for i in range(main.MAX_UPLOAD_FILES + 1)]
+        response = client.post(
+            "/api/emails/upload",
+            data={"subject": "Test", "body": "body"},
+            files=files,
+        )
+        self.assertEqual(response.status_code, 413)
+
+    def test_missing_required_fields_returns_422(self):
+        response = client.post("/api/emails/upload", data={"subject": "Test"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_processing_failure_keeps_record_and_returns_it(self):
+        failed_row = {
+            "email_id": "upload_abc123",
+            "processing_status": "failed",
+            "last_error": "RuntimeError: processing failed",
+        }
+        with patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", side_effect=RuntimeError("boom")), \
+             patch.object(database, "get_email", return_value=failed_row) as mocked_get:
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Test", "body": "body"},
+                files=[("files", ("si.txt", b"content", "text/plain"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), failed_row)
+        mocked_get.assert_called_once()
+
+
+def _make_zip(entries: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+class ZipUploadTests(unittest.TestCase):
+    def test_zip_with_txt_pair_creates_one_email_with_two_attachments(self):
+        zip_bytes = _make_zip({"si.txt": b"SI content", "bl.txt": b"BL content"})
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record") as mocked_attach, \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Zip upload", "body": "please verify"},
+                files=[("files", ("docs.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_upload.call_count, 2)
+        self.assertEqual(mocked_attach.call_count, 2)
+        mocked_source.assert_called_once()
+        self.assertEqual(
+            sorted(mocked_source.call_args.kwargs["source_attachments"]),
+            ["bl.txt", "si.txt"],
+        )
+
+    def test_zip_slip_path_traversal_is_neutralized(self):
+        zip_bytes = _make_zip({"../../evil.txt": b"payload", "../escape.txt": b"payload2"})
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Zip slip", "body": "body"},
+                files=[("files", ("evil.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        for call in mocked_upload.call_args_list:
+            storage_path = call.args[0]
+            self.assertNotIn("..", storage_path)
+        for name in mocked_source.call_args.kwargs["source_attachments"]:
+            self.assertNotIn("..", name)
+            self.assertNotIn("/", name)
+
+    def test_zip_exceeding_file_count_limit_is_rejected(self):
+        entries = {f"f{i}.txt": b"x" for i in range(main.ZIP_MAX_FILES + 1)}
+        zip_bytes = _make_zip(entries)
+        with patch.object(database, "upload_document") as mocked_upload:
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Too many", "body": "body"},
+                files=[("files", ("many.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 413)
+        mocked_upload.assert_not_called()
+
+    def test_zip_exceeding_uncompressed_size_limit_is_rejected(self):
+        zip_bytes = _make_zip({"big.txt": b"x" * 1000})
+        with patch.object(main, "ZIP_MAX_UNCOMPRESSED_BYTES", 100), \
+             patch.object(database, "upload_document") as mocked_upload:
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Too big", "body": "body"},
+                files=[("files", ("big.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 413)
+        mocked_upload.assert_not_called()
+
+    def test_zip_inside_zip_is_not_extracted_further(self):
+        inner_zip = _make_zip({"deep.txt": b"deep content"})
+        outer_zip = _make_zip({"nested.zip": inner_zip, "top.txt": b"top content"})
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Nested", "body": "body"},
+                files=[("files", ("outer.zip", outer_zip, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        # nested.zip itself is stored as a passthrough attachment, not expanded.
+        self.assertEqual(
+            sorted(mocked_source.call_args.kwargs["source_attachments"]),
+            ["nested.zip", "top.txt"],
+        )
+        self.assertEqual(mocked_upload.call_count, 2)
+
+
+class EmlUploadTests(unittest.TestCase):
+    def test_eml_with_two_attachments_parses_correctly(self):
+        eml_bytes = (
+            b"From: sender@example.com\r\n"
+            b"Subject: Please verify BL\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+            b"\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"Please compare the attached SI and BL.\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b'Content-Disposition: attachment; filename="si.txt"\r\n'
+            b"\r\n"
+            b"SI content\r\n"
+            b"--BOUNDARY\r\n"
+            b"Content-Type: text/plain\r\n"
+            b'Content-Disposition: attachment; filename="bl.txt"\r\n'
+            b"\r\n"
+            b"BL content\r\n"
+            b"--BOUNDARY--\r\n"
+        )
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record") as mocked_attach, \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("incoming.eml", eml_bytes, "message/rfc822"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_upload.call_count, 2)
+        self.assertEqual(mocked_attach.call_count, 2)
+        source_kwargs = mocked_source.call_args.kwargs
+        self.assertEqual(source_kwargs["sender"], "sender@example.com")
+        self.assertEqual(source_kwargs["subject"], "Please verify BL")
+        self.assertIn("compare", source_kwargs["body"])
+        self.assertEqual(sorted(source_kwargs["source_attachments"]), ["bl.txt", "si.txt"])
+
+    def test_eml_upload_does_not_require_subject_or_body_form_fields(self):
+        eml_bytes = b"From: a@b.com\r\nSubject: Hi\r\n\r\nBody text\r\n"
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+        with patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("no_form_fields.eml", eml_bytes, "message/rfc822"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        mocked_source.assert_called_once()
+
+
+class OrganizerJsonUploadTests(unittest.TestCase):
+    def test_organizer_format_json_import(self):
+        record = {
+            "email_id": "email_004",
+            "from": "shipper@example.com",
+            "subject": "SI for shipment 004",
+            "body": "Please find SI attached.",
+            "attachments": ["attachments/email_004_SI.txt"],
+        }
+        payload = json.dumps(record).encode("utf-8")
+        fake_result = EmailResult(email_id="placeholder", category="SI_REQUEST", status="OK")
+        with patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("email_004.json", payload, "application/json"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        source_kwargs = mocked_source.call_args.kwargs
+        self.assertEqual(source_kwargs["sender"], "shipper@example.com")
+        self.assertEqual(source_kwargs["subject"], "SI for shipment 004")
+        self.assertEqual(source_kwargs["body"], "Please find SI attached.")
+        self.assertEqual(source_kwargs["source_attachments"], ["attachments/email_004_SI.txt"])
+
+
+class MultiFileUploadTests(unittest.TestCase):
+    def test_six_or_more_files_in_one_request_succeeds(self):
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+        files = [("files", (f"f{i}.txt", f"content {i}".encode(), "text/plain")) for i in range(6)]
+        with patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result):
+            response = client.post(
+                "/api/emails/upload",
+                data={"subject": "Six files", "body": "body"},
+                files=files,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_upload.call_count, 6)
+        self.assertEqual(len(mocked_source.call_args.kwargs["source_attachments"]), 6)
+
+
+def _make_bundle_zip(records: list, attachments: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for record in records:
+            zf.writestr(f"inbox/{record['email_id']}.json", json.dumps(record))
+        for path, data in attachments.items():
+            zf.writestr(path, data)
+    return buf.getvalue()
+
+
+_BUNDLE_RECORDS = [
+    {
+        "email_id": "email_001",
+        "from": "a@example.com",
+        "subject": "SI 1",
+        "body": "body 1",
+        "attachments": ["attachments/email_001_SI.txt"],
+    },
+    {
+        "email_id": "email_002",
+        "from": "b@example.com",
+        "subject": "SI 2",
+        "body": "body 2",
+        "attachments": ["attachments/email_002_SI.txt"],
+    },
+    {
+        "email_id": "email_003",
+        "from": "c@example.com",
+        "subject": "SI 3",
+        "body": "body 3",
+        "attachments": [],
+    },
+]
+
+_BUNDLE_ATTACHMENTS = {
+    "attachments/email_001_SI.txt": b"SI one",
+    "attachments/email_002_SI.txt": b"SI two",
+}
+
+
+class BundleUploadTests(unittest.TestCase):
+    def test_bundle_shaped_zip_creates_batch_and_processes_all_emails(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="BL_COMPARISON", status="OK")
+        with patch.object(database, "create_batch") as mocked_create_batch, \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "upload_document") as mocked_upload, \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source") as mocked_source, \
+             patch.object(orchestration, "process_and_persist_email", return_value=fake_result) as mocked_process:
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total"], 3)
+        self.assertEqual(body["status"], "processing")
+        self.assertTrue(body["batch_id"].startswith("batch_"))
+
+        mocked_create_batch.assert_called_once()
+        self.assertEqual(mocked_create_batch.call_args.kwargs["total"], 3)
+
+        # All 3 emails were processed (background task ran synchronously
+        # under TestClient), each keyed by a batch-namespaced composite id
+        # while carrying its original_email_id through upsert_email_source.
+        self.assertEqual(mocked_process.call_count, 3)
+        original_ids = {call.kwargs.get("original_email_id") for call in mocked_source.call_args_list}
+        self.assertEqual(original_ids, {"email_001", "email_002", "email_003"})
+        for call in mocked_process.call_args_list:
+            composite_id = call.args[0]
+            self.assertTrue(composite_id.startswith(body["batch_id"] + "__"))
+
+        # 2 attachments uploaded (email_003 has none).
+        self.assertEqual(mocked_upload.call_count, 2)
+
+        # Progress was updated incrementally, ending at done=3, failed=0,
+        # status=completed.
+        final_call = mocked_progress.call_args_list[-1]
+        self.assertEqual(final_call.kwargs.get("status"), "completed")
+
+    def test_batch_progress_counts_update_correctly_including_failures(self):
+        zip_bytes = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+
+        def flaky_process(email_id):
+            if email_id.endswith("email_002"):
+                raise RuntimeError("simulated failure")
+            return EmailResult(email_id=email_id, category="GENERAL", status="OK")
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress") as mocked_progress, \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", side_effect=flaky_process):
+            response = client.post(
+                "/api/emails/upload",
+                files=[("files", ("bundle.zip", zip_bytes, "application/zip"))],
+            )
+        self.assertEqual(response.status_code, 200)
+
+        done_failed_pairs = [
+            (call.kwargs.get("done"), call.kwargs.get("failed"))
+            for call in mocked_progress.call_args_list
+            if call.kwargs.get("done") is not None or call.kwargs.get("failed") is not None
+        ]
+        final_done, final_failed = done_failed_pairs[-1]
+        self.assertEqual(final_done, 2)
+        self.assertEqual(final_failed, 1)
+
+    def test_two_batches_with_same_original_email_ids_do_not_collide(self):
+        zip_bytes_a = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        zip_bytes_b = _make_bundle_zip(_BUNDLE_RECORDS, _BUNDLE_ATTACHMENTS)
+        fake_result = EmailResult(email_id="placeholder", category="GENERAL", status="OK")
+
+        seen_composite_ids = []
+
+        def capture_process(email_id):
+            seen_composite_ids.append(email_id)
+            return fake_result
+
+        with patch.object(database, "create_batch"), \
+             patch.object(database, "update_batch_progress"), \
+             patch.object(database, "upload_document"), \
+             patch.object(database, "create_attachment_record"), \
+             patch.object(database, "upsert_email_source"), \
+             patch.object(orchestration, "process_and_persist_email", side_effect=capture_process):
+            response_a = client.post(
+                "/api/emails/upload", files=[("files", ("bundle_a.zip", zip_bytes_a, "application/zip"))]
+            )
+            response_b = client.post(
+                "/api/emails/upload", files=[("files", ("bundle_b.zip", zip_bytes_b, "application/zip"))]
+            )
+
+        batch_id_a = response_a.json()["batch_id"]
+        batch_id_b = response_b.json()["batch_id"]
+        self.assertNotEqual(batch_id_a, batch_id_b)
+
+        ids_from_a = {cid for cid in seen_composite_ids if cid.startswith(batch_id_a + "__")}
+        ids_from_b = {cid for cid in seen_composite_ids if cid.startswith(batch_id_b + "__")}
+        # No overlap between the two batches' actual persisted email_ids,
+        # even though both batches share the same underlying original
+        # organizer email_ids (email_001/002/003).
+        self.assertEqual(ids_from_a & ids_from_b, set())
+        self.assertEqual(len(ids_from_a), 3)
+        self.assertEqual(len(ids_from_b), 3)
+
+
+class GetBatchEndpointTests(unittest.TestCase):
+    def test_existing_batch_returns_200(self):
+        fake_batch = {
+            "batch_id": "batch_abc123",
+            "total": 3,
+            "done": 2,
+            "failed": 1,
+            "status": "completed",
+            "created_at": "2026-09-22T00:00:00+00:00",
+            "finished_at": "2026-09-22T00:01:00+00:00",
+        }
+        with patch.object(database, "get_batch", return_value=fake_batch) as mocked:
+            response = client.get("/api/batches/batch_abc123")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), fake_batch)
+        mocked.assert_called_once_with("batch_abc123")
+
+    def test_missing_batch_returns_404(self):
+        with patch.object(database, "get_batch", return_value=None):
+            response = client.get("/api/batches/batch_missing")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("batch_missing", response.json()["detail"])
+
+
+class ExportSubmissionFormatTests(unittest.TestCase):
+    def test_submission_format_returns_organizer_shape_keyed_by_original_email_id(self):
+        fake_rows = [
+            {
+                "email_id": "batch_xyz__email_001",
+                "original_email_id": "email_001",
+                "category": "BL_COMPARISON",
+                "status": "MISMATCH",
+                "review_reason": None,
+                "has_defect": True,
+                "defect_fields": ["shipper"],
+            },
+            {
+                "email_id": "email_010",
+                "original_email_id": None,
+                "category": "SI_REQUEST",
+                "status": "OK",
+                "review_reason": None,
+                "has_defect": False,
+                "defect_fields": [],
+            },
+        ]
+        with patch.object(database, "list_emails", return_value=fake_rows) as mocked:
+            response = client.get("/api/emails/export?format=submission&batch_id=batch_xyz")
+        self.assertEqual(response.status_code, 200)
+        mocked.assert_called_once_with(
+            status=None, category=None, processing_status=None, batch_id="batch_xyz", limit=main.EXPORT_MAX_ROWS
+        )
+        body = response.json()
+        self.assertEqual(
+            body,
+            {
+                "email_001": {
+                    "category": "BL_COMPARISON",
+                    "status": "MISMATCH",
+                    "review_reason": None,
+                    "defect_fields": ["shipper"],
+                    "has_defect": True,
+                },
+                "email_010": {
+                    "category": "SI_REQUEST",
+                    "status": "OK",
+                    "review_reason": None,
+                    "defect_fields": [],
+                    "has_defect": False,
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

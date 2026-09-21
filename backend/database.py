@@ -141,6 +141,8 @@ def upsert_email_source(
     subject: str | None = None,
     body: str | None = None,
     source_attachments: list[str] | None = None,
+    batch_id: str | None = None,
+    original_email_id: str | None = None,
 ) -> dict:
     """Persist only the raw organizer source fields for an email.
 
@@ -149,6 +151,14 @@ def upsert_email_source(
     review_reason/decided_by/notes/processing_status/retry_count/last_error/
     reviewed_at/reviewer_notes. Safe to call repeatedly for the same
     email_id: it only ever updates these same raw columns.
+
+    batch_id/original_email_id are additive, optional columns (see
+    schema.sql's batch-upload migration section) used only by batch-upload
+    processing: they let two batches reuse the same original organizer
+    email_id without colliding, since the row's actual primary key
+    (email_id) is a batch-namespaced id such as "batch_xxx__email_004"
+    while original_email_id preserves the organizer's own id for exports.
+    Both are simply left None for every other caller.
     """
     if not email_id:
         raise ValueError("upsert_email_source() requires a non-empty 'email_id'")
@@ -159,6 +169,8 @@ def upsert_email_source(
         "subject": subject,
         "body": body,
         "source_attachments": source_attachments,
+        "batch_id": batch_id,
+        "original_email_id": original_email_id,
     }
     client = get_supabase_client()
     response = (
@@ -174,9 +186,10 @@ def list_emails(
     status: str | None = None,
     category: str | None = None,
     processing_status: str | None = None,
+    batch_id: str | None = None,
     limit: int = 100,
 ) -> list[dict]:
-    """Minimal dashboard listing, optionally filtered by status/category/processing_status."""
+    """Minimal dashboard listing, optionally filtered by status/category/processing_status/batch_id."""
     client = get_supabase_client()
     query = client.table("emails").select("*")
     if status is not None:
@@ -185,6 +198,8 @@ def list_emails(
         query = query.eq("category", category)
     if processing_status is not None:
         query = query.eq("processing_status", processing_status)
+    if batch_id is not None:
+        query = query.eq("batch_id", batch_id)
     response = query.order("created_at", desc=True).limit(limit).execute()
     return response.data
 
@@ -317,3 +332,71 @@ def create_signed_document_url(
     if not url:
         raise RuntimeError(f"Supabase did not return a signed URL for {storage_path!r}")
     return url
+
+
+# --- Batch upload tracking (see schema.sql's batch-upload migration section) ---
+
+
+def create_batch(batch_id: str, *, total: int) -> dict:
+    """Create (or reset, if re-run with the same id) one batch progress row."""
+    row = {
+        "batch_id": batch_id,
+        "total": total,
+        "done": 0,
+        "failed": 0,
+        "status": "processing",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+    }
+    client = get_supabase_client()
+    response = (
+        client.table("batches")
+        .upsert(row, on_conflict="batch_id")
+        .execute()
+    )
+    return response.data[0] if response.data else row
+
+
+def get_batch(batch_id: str) -> dict | None:
+    """Fetch one batch progress row by batch_id, or None if it does not exist."""
+    client = get_supabase_client()
+    response = (
+        client.table("batches")
+        .select("*")
+        .eq("batch_id", batch_id)
+        .maybe_single()
+        .execute()
+    )
+    return response.data if response is not None else None
+
+
+def update_batch_progress(
+    batch_id: str,
+    *,
+    done: int | None = None,
+    failed: int | None = None,
+    status: str | None = None,
+    finished: bool = False,
+) -> dict | None:
+    """Update a batch's done/failed counts and/or status. Only the fields
+    supplied are written; `finished=True` also stamps `finished_at`."""
+    updates: dict = {}
+    if done is not None:
+        updates["done"] = done
+    if failed is not None:
+        updates["failed"] = failed
+    if status is not None:
+        updates["status"] = status
+    if finished:
+        updates["finished_at"] = datetime.now(timezone.utc).isoformat()
+    if not updates:
+        return get_batch(batch_id)
+
+    client = get_supabase_client()
+    response = (
+        client.table("batches")
+        .update(updates)
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    return response.data[0] if response.data else None
