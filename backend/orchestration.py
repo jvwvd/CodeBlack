@@ -176,8 +176,13 @@ def apply_review_correction(
     missing_reason = reliability.check_missing_values(resolved_si, resolved_bl)
 
     if missing_reason:
+        # Same invariant pipeline.run._finalize() enforces: review_reason
+        # means verification did not complete, so any provisional defects
+        # from comparing a field that turned out to be missing are not
+        # authoritative and must not be reported alongside NEEDS_REVIEW.
         status = "NEEDS_REVIEW"
         review_reason = missing_reason
+        defects = []
     else:
         status = "MISMATCH" if defects else "OK"
         review_reason = None

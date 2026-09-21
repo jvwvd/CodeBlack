@@ -446,6 +446,26 @@ class ApplyReviewCorrectionTests(unittest.TestCase):
         kwargs = mocked_save.call_args.kwargs
         self.assertEqual(kwargs["status"], "NEEDS_REVIEW")
         self.assertEqual(kwargs["review_reason"], "missing_value")
+        self.assertFalse(kwargs["has_defect"])
+        self.assertEqual(kwargs["defect_fields"], [])
+
+    def test_missing_value_with_apparent_difference_strips_defects(self):
+        # Organizer README invariant: NEEDS_REVIEW must never also carry
+        # has_defect/defect_fields, even when the incomplete side ALSO
+        # differs from the other side on a field that IS present.
+        row = self._row()
+        incomplete_si = ShipmentFields(**{
+            **row["si"], "container_count": None, "shipper": "SOMEONE ELSE LTD",
+        })
+        with patch.object(database, "get_email", return_value=row), \
+             patch.object(database, "save_review_correction", return_value={}) as mocked_save:
+            orchestration.apply_review_correction("email_010", si=incomplete_si, bl=None, reviewer_notes=None)
+
+        kwargs = mocked_save.call_args.kwargs
+        self.assertEqual(kwargs["status"], "NEEDS_REVIEW")
+        self.assertEqual(kwargs["review_reason"], "missing_value")
+        self.assertFalse(kwargs["has_defect"])
+        self.assertEqual(kwargs["defect_fields"], [])
 
     def test_reviewer_notes_passed_through_when_provided(self):
         row = self._row(reviewer_notes="old note")
@@ -474,6 +494,8 @@ class ApplyReviewCorrectionTests(unittest.TestCase):
         kwargs = mocked_save.call_args.kwargs
         self.assertEqual(kwargs["status"], "NEEDS_REVIEW")
         self.assertEqual(kwargs["review_reason"], "missing_value")
+        self.assertFalse(kwargs["has_defect"])
+        self.assertEqual(kwargs["defect_fields"], [])
 
 
 class SafeErrorMessageTests(unittest.TestCase):
