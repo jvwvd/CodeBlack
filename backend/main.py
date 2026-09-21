@@ -298,6 +298,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],
 )
 
 
@@ -314,18 +315,48 @@ def health():
 
 @app.get("/api/emails")
 def list_emails(
+    response: Response,
     status: str | None = None,
     category: str | None = None,
     processing_status: str | None = None,
+    batch_id: str | None = None,
     limit: int = 100,
+    offset: int = Query(0, ge=0),
 ):
     items = database.list_emails(
         status=status,
         category=category,
         processing_status=processing_status,
+        batch_id=batch_id,
         limit=limit,
+        offset=offset,
     )
+    total = database.count_emails(
+        status=status,
+        category=category,
+        processing_status=processing_status,
+        batch_id=batch_id,
+    )
+    response.headers["X-Total-Count"] = str(total)
     return {"items": items, "count": len(items)}
+
+
+@app.get("/api/emails/count")
+def count_emails(
+    status: str | None = None,
+    category: str | None = None,
+    processing_status: str | None = None,
+    batch_id: str | None = None,
+):
+    # Declared before GET /api/emails/{email_id} so FastAPI does not match
+    # "count" as an email_id path parameter (same reasoning as /api/emails/export).
+    total = database.count_emails(
+        status=status,
+        category=category,
+        processing_status=processing_status,
+        batch_id=batch_id,
+    )
+    return {"total": total}
 
 
 @app.get("/api/emails/export")

@@ -1,8 +1,9 @@
 # Upload / Batch / Export API
 
 Reference for the frontend. Covers `POST /api/emails/upload`, `GET /api/batches/{batch_id}`,
-and `GET /api/emails/export`. All limits and status codes below are read directly from
-`backend/main.py` on branch `feature/export-upload`.
+`GET /api/emails` (listing/pagination), `GET /api/emails/count`, and `GET /api/emails/export`.
+All limits and status codes below are read directly from `backend/main.py` on branch
+`feature/export-upload`.
 
 ## Limits
 
@@ -143,6 +144,52 @@ Returns immediately. Processing happens in the background with 3 workers, callin
 
 Note: a corrupt or unreadable *inner* file (not the zip container itself) is not an error — it is
 stored and the resulting email is marked `NEEDS_REVIEW` by the pipeline.
+
+---
+
+## `GET /api/emails`
+
+Query parameters (all optional): `status`, `category`, `processing_status`, `batch_id`,
+`limit` (default 100, no server-side maximum — unchanged from before), `offset` (default 0,
+negative values return `422`).
+
+Response body is unchanged: `{"items": [...], "count": N}` where `count` is the number of
+rows in *this page* (not the total). Sorted by `created_at` descending, then `email_id`
+ascending as a deterministic tie-breaker, so paginating with `limit`/`offset` never skips or
+duplicates a row even when several rows share the same `created_at`.
+
+**Total count**: the full matching row count (same filters, ignoring `limit`/`offset`) is
+returned in the `X-Total-Count` response header — not in the JSON body, so existing callers
+that only read the body are unaffected. CORS exposes this header
+(`Access-Control-Expose-Headers: X-Total-Count`) so a browser-based frontend on a different
+origin can read it via `response.headers.get('X-Total-Count')`.
+
+Calls that only pass `limit` (or nothing at all) get exactly the same response shape as
+before this change.
+
+```
+GET /api/emails?batch_id=batch_xyz&status=MISMATCH&limit=20&offset=40
+```
+```
+200 OK
+X-Total-Count: 137
+
+{ "items": [ { "email_id": "email_041", "...": "..." }, "...": "..." ], "count": 20 }
+```
+
+## `GET /api/emails/count`
+
+Same filters as `GET /api/emails` (`status`, `category`, `processing_status`, `batch_id`),
+no `limit`/`offset`. Declared before `GET /api/emails/{email_id}` so `/api/emails/count` is
+never matched as an `email_id` path parameter.
+
+```
+GET /api/emails/count?batch_id=batch_xyz
+```
+```json
+200 OK
+{ "total": 137 }
+```
 
 ---
 
