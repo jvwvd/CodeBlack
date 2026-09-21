@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  // SDOC backend: Cloudflare Worker + Container deployment.
+  // See PROJECT_RULES.md §2 (deployment target) and §20 (lifecycle notes).
+  "name": "sdoc-backend",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-22",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Non-secret config only. Every other value backend/config.py's
+  // Settings() reads (SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY,
+  // OPENCODE_API_KEY, OPENCODE_MODEL, FRONTEND_URL) is a Worker secret set
+  // with `wrangler secret put <NAME>` before first deploy — never a plain
+  // var, never committed here.
+  "vars": {
+    "APP_ENV": "production"
+  },
+
+  "containers": [
+    {
+      "class_name": "BackendContainer",
+      // Build context is backend/ (the directory containing the
+      // Dockerfile) — matches its own COPY requirements.txt . / COPY . .
+      // assumptions unchanged from the prior Cloud Run deployment.
+      "image": "./backend/Dockerfile",
+      // One backend instance: batch-upload progress tracking is in-process
+      // (see src/index.js), so this must not scale beyond a single
+      // container. Raise only alongside a matching architecture change
+      // (e.g. moving batch state into Supabase/a queue).
+      "max_instances": 1,
+      // 1/2 vCPU, 4 GiB memory, 8 GB disk. Sized for concurrent PDF
+      // rendering (PyMuPDF) and vision/OCR base64 image payloads without
+      // needing to re-tune BATCH_WORKERS; adjust down to "basic" only
+      // after confirming memory headroom in practice.
+      "instance_type": "standard-1"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "BACKEND_CONTAINER", "class_name": "BackendContainer" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BackendContainer"] }
+  ]
+}

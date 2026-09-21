@@ -1,0 +1,15 @@
+{
+  "name": "sdoc-backend-worker",
+  "private": true,
+  "description": "Cloudflare Worker + Container deployment entrypoint for the SDOC FastAPI backend (see wrangler.jsonc, src/index.js).",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "wrangler": "^4.136.1"
+  }
+}

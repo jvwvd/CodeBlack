@@ -35,7 +35,7 @@ Inbox
 | Layer | Technology | Deployment |
 |---|---|---|
 | Frontend | React + Vite + Tailwind | Vercel |
-| Backend | Python + FastAPI + Pydantic, Docker | Google Cloud Run |
+| Backend | Python + FastAPI + Pydantic, Docker | Cloudflare Containers |
 | Persistence | Supabase PostgreSQL + Supabase Storage | Supabase |
 | AI | Gemini, or another team-approved multimodal LLM | — |
 | Documents | PyMuPDF, python-docx, openpyxl; OCR/vision only when native parsing is insufficient | — |
@@ -293,7 +293,7 @@ It already provides source-independent access for:
 
 **Do not add Supabase/cloud helpers to the organizer's `loader.py`. Do not refactor it.** If cloud-sourced email access is ever needed, it belongs in a separate function, not a modification of this file (see §3, §16 for ownership).
 
-**Development/evaluation vs. deployment data source.** `backend/loader.py` (and the organizer bundle/Docker server it reads from) is a **development and evaluation dependency only** — used for local pipeline development and for `evaluation/`'s full-dataset runs and `/submit` scoring. The **deployed** Cloud Run application never calls `loader.py` and must never depend on the organizer Docker server being reachable at runtime. Instead, the organizer's participant data is imported once into our own Supabase PostgreSQL + private Storage (see §14, "Cloud Import"), and the deployed API and pipeline read exclusively from there. `backend/import_organizer_data.py` (§3, §16) is the one deliberate bridge allowed to call both `loader.py` and `database.py` in the same process — nothing else should.
+**Development/evaluation vs. deployment data source.** `backend/loader.py` (and the organizer bundle/Docker server it reads from) is a **development and evaluation dependency only** — used for local pipeline development and for `evaluation/`'s full-dataset runs and `/submit` scoring. The **deployed** Cloudflare Containers application never calls `loader.py` and must never depend on the organizer Docker server being reachable at runtime. Instead, the organizer's participant data is imported once into our own Supabase PostgreSQL + private Storage (see §14, "Cloud Import"), and the deployed API and pipeline read exclusively from there. `backend/import_organizer_data.py` (§3, §16) is the one deliberate bridge allowed to call both `loader.py` and `database.py` in the same process — nothing else should.
 
 ---
 
@@ -494,7 +494,7 @@ The reviewer workflow may correct or confirm a result. When surfacing a case for
 - `backend/loader.py` integration responsibility (the organizer file itself remains unmodified, per §11)
 - `backend/import_organizer_data.py` — organizer bundle → Supabase cloud dataset import (see §14, "Cloud Import")
 - `backend/orchestration.py` — Supabase → Member-1 pipeline bridge (see below)
-- FastAPI, Supabase PostgreSQL/Storage, Cloud Run, backend integration/deployment
+- FastAPI, Supabase PostgreSQL/Storage, Cloudflare Containers, backend integration/deployment
 
 **Member 3 — Frontend**
 - `frontend/` — dashboard, inbox, comparison UI, review UI, processing/error UI

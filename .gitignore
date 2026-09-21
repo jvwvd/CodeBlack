@@ -15,6 +15,9 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 
+# Cloudflare Workers/Wrangler local state
+.wrangler/
+
 # IDE / OS
 .vscode/
 .idea/
