@@ -13,6 +13,7 @@ from pipeline.documents import (
     parse_attachment_bytes,
 )
 from pipeline.extract import extract_fields
+from pipeline.normalize import norm_port
 from pipeline.run import _finalize, process_email
 from models import EmailResult
 
@@ -788,6 +789,128 @@ class AltLabelEndToEndComparisonTests(unittest.TestCase):
         # Exactly the field that actually differs -- no spurious extras from
         # a bled label/address, no missing genuine defect.
         self.assertEqual(result.defect_fields, ["consignee"])
+
+
+class NormPortIdentityTests(unittest.TestCase):
+    """Regression coverage for the residual E2E diagnosis's port fix:
+    norm_port() previously trusted a (LOCODE) in parens over the port
+    name, so two genuinely different ports sharing a stale/coincidental
+    code normalized as equal (e.g. a defect-injected port name change
+    that left the original LOCODE in place). Port identity must now be
+    name-primary; the code is only a fallback when no name text remains."""
+
+    def test_same_name_and_same_code_matches(self):
+        self.assertEqual(
+            norm_port("Nhava Sheva, India (INNSA)"),
+            norm_port("NHAVA SHEVA, INDIA (INNSA)"),
+        )
+
+    def test_same_name_with_case_and_punctuation_differences_matches(self):
+        self.assertEqual(
+            norm_port("Port Klang (Westport), Malaysia (MYPKG)"),
+            norm_port("PORT   KLANG   (WESTPORT),   MALAYSIA   (MYPKG)"),
+        )
+
+    def test_different_name_with_same_code_does_not_match(self):
+        # The confirmed bug: a shared LOCODE must not hide a different
+        # port name.
+        self.assertNotEqual(
+            norm_port("MOMBASA, KENYA (KEMBA)"),
+            norm_port("TUTICORIN, INDIA (KEMBA)"),
+        )
+
+    def test_same_name_with_code_missing_on_one_side_still_matches(self):
+        self.assertEqual(
+            norm_port("SINGAPORE"),
+            norm_port("SINGAPORE (SGSIN)"),
+        )
+
+    def test_different_names_and_different_codes_does_not_match(self):
+        self.assertNotEqual(
+            norm_port("MERSIN, TURKEY (TRMER)"),
+            norm_port("LONG BEACH, US (TRMER)"),
+        )
+        self.assertNotEqual(
+            norm_port("SINGAPORE (SGSIN)"),
+            norm_port("PORT KLANG (WESTPORT), MALAYSIA (MYPKG)"),
+        )
+
+    def test_all_confirmed_diagnosis_examples_now_mismatch(self):
+        confirmed_bug_pairs = (
+            ("MOMBASA, KENYA (KEMBA)", "TUTICORIN, INDIA (KEMBA)"),
+            ("PORT KLANG (MYPKG)", "SINGAPORE (MYPKG)"),
+            ("NHAVA SHEVA (INNSA)", "BUATAN (INNSA)"),
+            ("MERSIN (TRMER)", "LONG BEACH (TRMER)"),
+            ("SINGAPORE (SGSIN)", "PORT KLANG (SGSIN)"),
+        )
+        for si_port, bl_port in confirmed_bug_pairs:
+            with self.subTest(si=si_port, bl=bl_port):
+                self.assertNotEqual(norm_port(si_port), norm_port(bl_port))
+
+
+class PortMismatchEndToEndTests(unittest.TestCase):
+    """Confirms the norm_port() fix actually changes process_email()'s
+    downstream verdict for a genuine port defect, not just the helper
+    function in isolation."""
+
+    def _si_bl_text(self, si_port_of_discharge, bl_port_of_discharge):
+        si = f"""
+SHIPPING INSTRUCTION
+
+Shipper: TEST EXPORTER LTD
+Consignee: TEST IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Port of Loading: SINGAPORE (SGSIN)
+Port of Discharge: {si_port_of_discharge}
+Container Count: 3
+Gross Weight: 22000 KG
+"""
+        bl = f"""
+DRAFT BILL OF LADING
+
+Shipper: TEST EXPORTER LTD
+Consignee: TEST IMPORTER SDN BHD
+Notify Party: TEST IMPORTER SDN BHD
+Port of Loading: SINGAPORE (SGSIN)
+Port of Discharge: {bl_port_of_discharge}
+Container Count: 3
+Gross Weight: 22000 KG
+"""
+        return si, bl
+
+    def _process(self, si_port, bl_port):
+        si_text, bl_text = self._si_bl_text(si_port, bl_port)
+        email = {
+            "email_id": "email_test_port_defect",
+            "from": "ops@example.com",
+            "subject": "TO CONFIRM DOCS _ Please check draft BL against shipping instruction",
+            "body": "Please verify the shipping instruction against the draft bill of lading.",
+            "attachments": ["attachments/si.txt", "attachments/bl.txt"],
+        }
+        attachment_bytes = {
+            "attachments/si.txt": si_text.encode(),
+            "attachments/bl.txt": bl_text.encode(),
+        }
+        return process_email(email, attachment_bytes=attachment_bytes)
+
+    def test_stale_locode_no_longer_masks_a_genuine_port_defect(self):
+        # Same shape as the diagnosis's confirmed examples: the BL's port
+        # name genuinely changed but the old LOCODE was left in place.
+        result = self._process("MOMBASA, KENYA (KEMBA)", "TUTICORIN, INDIA (KEMBA)")
+
+        self.assertEqual(result.status, "MISMATCH")
+        self.assertIn("port_of_discharge", result.defect_fields)
+        self.assertTrue(result.has_defect)
+
+    def test_genuinely_matching_ports_still_resolve_ok(self):
+        result = self._process(
+            "KARACHI, PAKISTAN (PKKHI)",
+            "Karachi, Pakistan (PKKHI)",
+        )
+
+        self.assertEqual(result.status, "OK")
+        self.assertEqual(result.defect_fields, [])
+        self.assertFalse(result.has_defect)
 
 
 if __name__ == "__main__":
