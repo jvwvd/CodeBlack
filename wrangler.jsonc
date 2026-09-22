@@ -12,9 +12,10 @@
   // OPENCODE_API_KEY, OPENCODE_MODEL, FRONTEND_URL) is a Worker secret set
   // with `wrangler secret put <NAME>` before first deploy — never a plain
   // var, never committed here.
-  "vars": {
-    "APP_ENV": "production"
-  },
+"vars": {
+  "APP_ENV": "production",
+  "FRONTEND_URL": "https://codeblack.online"
+},
 
   "containers": [
     {
