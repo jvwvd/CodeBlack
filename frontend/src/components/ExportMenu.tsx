@@ -77,9 +77,14 @@ export function ExportMenu({
       </Button>
 
       {open ? (
+        // Anchored to the button's LEFT edge on small screens, where the header
+        // wraps the actions onto their own line at the left gutter: right-
+        // anchoring there pushes the panel off the left of the screen. From sm
+        // upwards the button sits on the right, so keep right-0. max-w keeps
+        // the panel inside the viewport whatever the width.
         <div
           role="menu"
-          className="panel absolute right-0 z-20 mt-1.5 w-72 overflow-hidden p-1 shadow-md"
+          className="panel absolute left-0 z-20 mt-1.5 w-72 max-w-[calc(100vw-2rem)] overflow-hidden p-1 shadow-md sm:right-0 sm:left-auto"
         >
           {EXPORT_OPTIONS.map((option) => (
             <button
@@ -91,8 +96,8 @@ export function ExportMenu({
               className="flex w-full items-start gap-2 rounded-control px-2.5 py-2 text-left hover:bg-canvas disabled:opacity-55"
             >
               <span className="min-w-0 flex-1">
-                <span className="block text-sm font-medium">{option.label}</span>
-                <span className="block text-2xs text-muted">{option.hint}</span>
+                <span className="block text-sm font-medium break-words">{option.label}</span>
+                <span className="block text-2xs break-words text-muted">{option.hint}</span>
               </span>
               {running === option.format ? (
                 <Check aria-hidden className="mt-0.5 size-4 shrink-0 text-accent" />
