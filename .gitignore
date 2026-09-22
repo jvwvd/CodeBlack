@@ -13,6 +13,7 @@ __pycache__/
 # Node
 node_modules/
 frontend/node_modules/
+dist/
 frontend/dist/
 
 # Cloudflare Workers/Wrangler local state
