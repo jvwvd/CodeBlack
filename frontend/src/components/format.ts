@@ -92,7 +92,9 @@ export function downloadBlob(blob: Blob, filename: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(href);
+  // Safari cancels an in-flight download if the object URL is revoked right
+  // after click(), so release it well after the browser has taken the blob.
+  window.setTimeout(() => URL.revokeObjectURL(href), 60_000);
 }
 
 export function setDocumentTitle(page: string): void {
