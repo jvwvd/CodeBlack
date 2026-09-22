@@ -15,7 +15,7 @@ import {
 import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 
-import { API_BASE_URL } from "../api";
+import { API_BASE_LABEL } from "../api";
 import { Wordmark } from "./Logo";
 import { Button } from "./ui";
 import { useEmailCount, useHealth } from "./queries";
@@ -44,7 +44,7 @@ const CONNECTION_DOT: Record<Connection, string> = {
 
 function ConnectionIndicator({ connection }: { connection: Connection }) {
   return (
-    <p className="flex items-center gap-2 text-2xs text-on-ink-muted" title={API_BASE_URL}>
+    <p className="flex items-center gap-2 text-2xs text-on-ink-muted" title={API_BASE_LABEL}>
       <span aria-hidden className={`size-2 shrink-0 rounded-full ${CONNECTION_DOT[connection]}`} />
       {CONNECTION_TEXT[connection]}
     </p>

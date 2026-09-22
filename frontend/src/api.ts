@@ -43,11 +43,24 @@ const TOTAL_COUNT_HEADER = "X-Total-Count";
  * backend URL is public, and the frontend never sees a Supabase or provider
  * key (PROJECT_RULES.md §14, §18).
  */
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
+const RAW_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 
-/** False when VITE_API_BASE_URL is missing or empty; the app then shows a
- * configuration screen instead of failing on every request. */
-export const IS_CONFIGURED = API_BASE_URL.length > 0;
+/**
+ * Prefix put in front of every request path.
+ *
+ * "/" means same origin: requests go to /api/... on whatever host serves the
+ * app, which in production is the Cloudflare Pages Function in
+ * functions/api/[[path]].js proxying to the backend. That keeps the browser
+ * on one origin, so backend CORS never applies. A full URL (for example the
+ * workers.dev address in .env.local) still works exactly as before.
+ */
+export const API_BASE_URL = RAW_BASE_URL === "/" ? "" : RAW_BASE_URL.replace(/\/+$/, "");
+
+/** False only when VITE_API_BASE_URL is missing or empty; "/" is configured. */
+export const IS_CONFIGURED = RAW_BASE_URL.length > 0;
+
+/** What to show a human: an empty base means the app's own origin. */
+export const API_BASE_LABEL = API_BASE_URL || "same origin";
 
 export class ApiError extends Error {
   readonly status: number;
